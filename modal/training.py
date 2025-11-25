@@ -172,9 +172,11 @@ def train_qwen3vl_lora(
     if use_preprocessed:
         print("🚀 Using preprocessed data (fast path)")
 
-        # Use explicit dataset name - no automatic selection
+        # Use explicit dataset name - extract base name to match preprocessing output
+        # e.g., "datasets/routing_20251125_050207" -> "routing_20251125_050207"
         preprocessed_base = Path("/moe-data/preprocessed")
-        latest_dataset_dir = preprocessed_base / dataset_name
+        base_dataset_name = Path(dataset_name).name
+        latest_dataset_dir = preprocessed_base / base_dataset_name
 
         if not latest_dataset_dir.exists():
             raise FileNotFoundError(
@@ -354,8 +356,8 @@ def train_qwen3vl_lora(
 
     # Determine train size based on whether we're using preprocessed or raw data
     if use_preprocessed:
-        # Read metadata to get train size
-        metadata_path = Path(f"/moe-data/preprocessed/{dataset_name}/metadata.json")
+        # Read metadata to get train size (use base_dataset_name to match preprocessing output)
+        metadata_path = Path(f"/moe-data/preprocessed/{base_dataset_name}/metadata.json")
         with open(metadata_path, 'r') as f:
             metadata = json.load(f)
         train_size = metadata['train_samples']
@@ -471,6 +473,12 @@ def train_qwen3vl_lora(
         print(f"🔧 Learning rate: {original_lr:.2e} → {learning_rate:.2e} (2x)")
         print(f"🔧 Patience: {original_patience} → {patience} (0.5x, min 2)\n")
 
+    # Loss weighting for tool_call tokens (used for computer use training)
+    # For routing training (simple classification), use equal weights
+    base_weight = 1.0
+    action_weight = 1.0
+    arg_weight = 1.0
+
     # ALWAYS print final hyperparameter values (whether auto-tuned or provided)
     print(f"\n{'='*80}")
     print("📋 Final Hyperparameters")
@@ -489,13 +497,9 @@ def train_qwen3vl_lora(
     print(f"   learning_rate: {learning_rate}")
     print(f"   num_epochs: {num_epochs}")
     print(f"   patience: {patience}")
-    print(f"\nLoss Weighting (tool_call only):")
-    print(f"   base_weight: {base_weight} (all tokens in <tool_call>)")
-    print(f"   action_weight: {action_weight} (action name field)")
-    print(f"   arg_weight: {arg_weight} (argument fields - coordinates!)")
     print(f"\nEarly Stopping:")
-    print(f"   Uses weighted eval metric: 10% action + 10% base + 80% arg")
-    print(f"   Min delta: 0.0005 (emphasizes coordinate precision)")
+    print(f"   Metric: eval_loss")
+    print(f"   Min delta: 0.0005")
     print()
 
     # ============================================================================
@@ -883,7 +887,7 @@ def train_qwen3vl_lora(
         save_steps=save_steps,
         save_total_limit=None,  # Keep ALL checkpoints
         load_best_model_at_end=True,
-        metric_for_best_model="eval_loss_weighted",  # Use weighted loss that emphasizes arg/coordinate precision
+        metric_for_best_model="eval_loss",  # Use standard eval loss
         greater_is_better=False,
         bf16=True,  # Use bfloat16 for H100
         gradient_checkpointing=True,  # Enable gradient checkpointing
@@ -897,35 +901,22 @@ def train_qwen3vl_lora(
         data_seed=420,  # Fixed seed for data shuffling
     )
 
-    # Early stopping callback
-    # Enhanced early stopping with LR reduction
+    # Simple early stopping callback
     from transformers import TrainerCallback
 
-    class ReduceLROnPlateauCallback(TrainerCallback):
+    class EarlyStoppingCallback(TrainerCallback):
         """
-        Reduces learning rate when eval loss plateaus, then stops if LR becomes too small.
-        Uses weighted eval loss that emphasizes arg (coordinate) precision.
+        Simple early stopping: stop training after `patience` evaluations with no improvement.
         """
-        def __init__(self, patience, min_delta, lr_reduction_factor, min_lr, max_reductions, initial_lr):
+        def __init__(self, patience, min_delta):
             self.patience = patience
             self.min_delta = min_delta
-            self.lr_reduction_factor = lr_reduction_factor
-            self.min_lr = min_lr
-            self.max_reductions = max_reductions
-            self.initial_lr = initial_lr
-
             self.best_metric = None
-            self.prev_metric = None  # Track previous eval for delta
+            self.prev_metric = None
             self.patience_counter = 0
-            self.num_reductions = 0
-            self.current_lr = initial_lr
 
         def on_evaluate(self, args, state, control, metrics, **kwargs):
-            # Use weighted eval loss (emphasizes arg/coordinate loss)
-            current_loss = metrics.get('eval_loss_weighted')
-            # Fallback to regular eval_loss if weighted not available
-            if current_loss is None:
-                current_loss = metrics.get('eval_loss')
+            current_loss = metrics.get('eval_loss')
             if current_loss is None:
                 return control
 
@@ -945,88 +936,36 @@ def train_qwen3vl_lora(
 
             # Display status with delta
             if self.prev_metric is not None:
-                delta = self.prev_metric - current_loss  # Positive = improvement
+                delta = self.prev_metric - current_loss
                 delta_str = f" (Δ={delta:+.6f})" if delta != 0 else ""
             else:
                 delta_str = ""
 
-            # Show component breakdown for debugging
-            metric_breakdown = ""
-            if 'loss/action' in metrics and 'loss/arg' in metrics and 'loss/base' in metrics:
-                metric_breakdown = f" [action: {metrics['loss/action']:.4f}, arg: {metrics['loss/arg']:.4f}, base: {metrics['loss/base']:.4f}]"
-
             if improved:
-                print(f"📊 Weighted eval loss improved: {current_loss:.6f} (best: {self.best_metric:.6f}){delta_str}{metric_breakdown}")
-                print(f"   LR: {self.current_lr:.2e} | Patience: {self.patience_counter}/{self.patience} | Reductions: {self.num_reductions}/{self.max_reductions}")
+                print(f"📊 Eval loss improved: {current_loss:.6f} (best: {self.best_metric:.6f}){delta_str}")
+                print(f"   Patience: {self.patience_counter}/{self.patience}")
             else:
-                print(f"📊 No improvement: {current_loss:.6f} vs best {self.best_metric:.6f}{delta_str}{metric_breakdown}")
-                print(f"   LR: {self.current_lr:.2e} | Patience: {self.patience_counter}/{self.patience} | Reductions: {self.num_reductions}/{self.max_reductions}")
+                print(f"📊 No improvement: {current_loss:.6f} vs best {self.best_metric:.6f}{delta_str}")
+                print(f"   Patience: {self.patience_counter}/{self.patience}")
 
-            # Update prev_metric for next eval
             self.prev_metric = current_loss
 
-            # Check if patience exceeded
+            # Check if patience exceeded - STOP immediately
             if self.patience_counter >= self.patience:
-                # Should we reduce LR or stop?
-                if self.current_lr > self.min_lr and self.num_reductions < self.max_reductions:
-                    # Reduce LR
-                    old_lr = self.current_lr
-                    self.current_lr *= self.lr_reduction_factor
-                    self.num_reductions += 1
-                    self.patience_counter = 0  # Reset patience
-
-                    # Update optimizer LR - get trainer from args
-                    # The Trainer instance has the optimizer, not the model
-                    if hasattr(args, '_trainer') and hasattr(args._trainer, 'optimizer'):
-                        for param_group in args._trainer.optimizer.param_groups:
-                            param_group['lr'] = self.current_lr
-                    elif 'optimizer' in kwargs:
-                        for param_group in kwargs['optimizer'].param_groups:
-                            param_group['lr'] = self.current_lr
-                    else:
-                        # Fallback: modify args.learning_rate for scheduler
-                        args.learning_rate = self.current_lr
-
-                    print(f"\n🔽 Reducing learning rate: {old_lr:.2e} → {self.current_lr:.2e}")
-                    print(f"   Reduction {self.num_reductions}/{self.max_reductions} | Resetting patience counter\n")
-                else:
-                    # Stop training
-                    if self.current_lr <= self.min_lr:
-                        print(f"\n⏹️  Stopping: LR {self.current_lr:.2e} ≤ min_lr {self.min_lr:.2e}")
-                    else:
-                        print(f"\n⏹️  Stopping: Hit max LR reductions ({self.num_reductions}/{self.max_reductions})")
-                    control.should_training_stop = True
+                print(f"\n⏹️  Early stopping triggered: {self.patience} evaluations with no improvement")
+                control.should_training_stop = True
 
             return control
 
-    # Auto-tune LR reduction parameters based on dataset size (already calculated above)
-    if train_size < 5000:
-        max_lr_reductions = 3
-        min_lr = 5e-7
-    elif train_size < 20000:
-        max_lr_reductions = 4
-        min_lr = 1e-7
-    else:
-        max_lr_reductions = 5
-        min_lr = 5e-8
-
-    early_stopping = ReduceLROnPlateauCallback(
+    early_stopping = EarlyStoppingCallback(
         patience=patience,
-        min_delta=0.0005,  # Minimum improvement threshold for weighted eval loss (focuses on arg/coordinate precision)
-        lr_reduction_factor=0.5,  # Halve the LR
-        min_lr=min_lr,
-        max_reductions=max_lr_reductions,
-        initial_lr=learning_rate,
+        min_delta=0.0005,
     )
 
-    print(f"\n📉 Early Stopping (LR Reduction on Plateau):")
-    print(f"   Metric: eval_loss_weighted (10% action + 10% base + 80% arg)")
-    print(f"   Min delta: 0.0005 (prevents easy tokens from washing out coordinate precision)")
-    print(f"   Initial LR: {learning_rate:.2e}")
-    print(f"   Patience: {patience} evals")
-    print(f"   Reduction factor: 0.5x")
-    print(f"   Min LR: {min_lr:.2e}")
-    print(f"   Max reductions: {max_lr_reductions}\n")
+    print(f"\n📉 Early Stopping:")
+    print(f"   Metric: eval_loss")
+    print(f"   Min delta: 0.0005")
+    print(f"   Patience: {patience} evals (then stop)\n")
 
     # Cost tracking callback
     class CostTrackingCallback(TrainerCallback):
@@ -1503,28 +1442,11 @@ def train_qwen3vl_lora(
             return (loss, outputs) if return_outputs else loss
 
         def log(self, logs, start_time=None):
-            """Override log method to include loss component tracking."""
-            # Add component losses to logs
-            if self.loss_components['action']:
-                logs['loss/action'] = sum(self.loss_components['action']) / len(self.loss_components['action'])
-                self.loss_components['action'].clear()
-
-            if self.loss_components['arg']:
-                logs['loss/arg'] = sum(self.loss_components['arg']) / len(self.loss_components['arg'])
-                self.loss_components['arg'].clear()
-
-            if self.loss_components['base']:
-                logs['loss/base'] = sum(self.loss_components['base']) / len(self.loss_components['base'])
-                self.loss_components['base'].clear()
-
-            # Compute weighted eval loss for early stopping (emphasizes arg loss)
-            # This prevents easy tokens (think, action names) from "washing out" hard tokens (coordinates)
-            if 'loss/arg' in logs:
-                # Weighted formula: 10% action + 10% base + 80% arg (coordinates are what matter most!)
-                action_component = logs.get('loss/action', logs.get('loss/arg', 0))
-                arg_component = logs.get('loss/arg', 0)
-                base_component = logs.get('loss/base', logs.get('loss/arg', 0))
-                logs['eval_loss_weighted'] = 0.1 * action_component + 0.1 * base_component + 0.8 * arg_component
+            """Override log method."""
+            # Clear any accumulated loss components (not used for routing training)
+            self.loss_components['action'].clear()
+            self.loss_components['arg'].clear()
+            self.loss_components['base'].clear()
 
             # Call parent log method with start_time if provided
             if start_time is not None:
@@ -1630,25 +1552,197 @@ def train_qwen3vl_lora(
     print(f"\n✅ Volumes committed")
 
     # ============================================================================
-    # STEP 8: Summary
+    # STEP 8: Auto-Evaluate on Held-Out Eval Data
     # ============================================================================
 
     print(f"\n{'='*80}")
-    print("🎉 TRAINING COMPLETE!")
+    print("📊 STEP 8: Running Evaluation on Held-Out Data")
+    print(f"{'='*80}\n")
+
+    eval_result = None
+    VALID_ADAPTERS = {"calendar", "claim-window", "provider-select"}
+
+    try:
+        from qwen_vl_utils import process_vision_info
+
+        # Load eval data (held-out, NOT validation)
+        eval_path = Path(f"/moe-data/{dataset_name}/eval.jsonl")
+        if not eval_path.exists():
+            eval_path = Path(f"/moe-data/datasets/{base_dataset_name}/eval.jsonl")
+
+        if not eval_path.exists():
+            print(f"⚠️  Eval data not found: {eval_path}")
+            print("   Skipping evaluation...")
+        else:
+            eval_data = []
+            with open(eval_path) as f:
+                for line in f:
+                    if line.strip():
+                        eval_data.append(json.loads(line))
+
+            eval_data = eval_data[:100]  # Use all 100 held-out samples
+            print(f"Eval samples: {len(eval_data)}")
+
+            # Load best checkpoint (the one the trainer loaded at the end)
+            print("Using best checkpoint (loaded by trainer)...")
+            model.eval()
+
+            # Run evaluation
+            results = {
+                "correct": 0,
+                "total": 0,
+                "per_class": {adapter: {"correct": 0, "total": 0} for adapter in VALID_ADAPTERS},
+            }
+
+            images_dir = eval_path.parent / "images"
+
+            for sample in tqdm(eval_data, desc="Evaluating"):
+                expected_adapter = sample["metadata"]["adapter"]
+
+                # Build prompt
+                messages = []
+                for conv in sample["conversations"]:
+                    if conv["from"] == "system":
+                        messages.append({"role": "system", "content": conv["value"]})
+                    elif conv["from"] == "human":
+                        content = []
+                        value = conv["value"]
+                        if "<image>" in value:
+                            img_name = Path(sample["image"]).name
+                            image_path = images_dir / img_name
+                            if image_path.exists():
+                                content.append({"type": "image", "image": f"file://{image_path}"})
+                            value = value.replace("<image>", "").strip()
+                        if value:
+                            content.append({"type": "text", "text": value})
+                        messages.append({"role": "user", "content": content})
+
+                try:
+                    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                    image_inputs, video_inputs = process_vision_info(messages)
+
+                    inputs = processor(
+                        text=[text],
+                        images=image_inputs,
+                        videos=video_inputs,
+                        return_tensors="pt",
+                        padding=True,
+                    )
+                    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+                    with torch.no_grad():
+                        outputs = model.generate(
+                            **inputs,
+                            max_new_tokens=50,
+                            do_sample=False,
+                            pad_token_id=processor.tokenizer.pad_token_id,
+                        )
+
+                    input_len = inputs["input_ids"].shape[1]
+                    generated = processor.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+                    predicted_adapter = generated.lower().strip()
+
+                    is_correct = predicted_adapter == expected_adapter
+
+                    results["total"] += 1
+                    results["per_class"][expected_adapter]["total"] += 1
+
+                    if is_correct:
+                        results["correct"] += 1
+                        results["per_class"][expected_adapter]["correct"] += 1
+
+                except Exception as e:
+                    print(f"Error: {e}")
+                    results["total"] += 1
+                    results["per_class"][expected_adapter]["total"] += 1
+
+            # Print results
+            overall_acc = results["correct"] / results["total"] * 100 if results["total"] > 0 else 0
+
+            print(f"\n{'='*70}")
+            print("EVAL RESULTS")
+            print(f"{'='*70}")
+            print(f"Overall accuracy: {results['correct']}/{results['total']} ({overall_acc:.1f}%)")
+
+            per_class_acc = {}
+            for adapter in VALID_ADAPTERS:
+                stats = results["per_class"][adapter]
+                if stats["total"] > 0:
+                    acc = stats["correct"] / stats["total"] * 100
+                    per_class_acc[adapter] = acc
+                    print(f"  {adapter:20s}: {stats['correct']:3d}/{stats['total']:3d} ({acc:.1f}%)")
+                else:
+                    per_class_acc[adapter] = None
+                    print(f"  {adapter:20s}: N/A (0 samples)")
+
+            # Build and save eval report
+            eval_report = {
+                "run_name": run_name,
+                "dataset_name": dataset_name,
+                "checkpoint": final_output_dir,
+                "eval_samples": len(eval_data),
+                "timestamp": datetime.now().isoformat(),
+                "accuracy": {
+                    "overall": overall_acc,
+                    "per_class": per_class_acc,
+                },
+                "results": {
+                    "correct": results["correct"],
+                    "total": results["total"],
+                    "per_class": results["per_class"],
+                },
+            }
+
+            # Save eval-report.json to the dataset folder
+            report_path = eval_path.parent / "eval-report.json"
+            with open(report_path, "w") as f:
+                json.dump(eval_report, f, indent=2)
+            print(f"\n📄 Eval report saved to: {report_path}")
+
+            # Commit volume
+            moe_volume.commit()
+
+            eval_result = eval_report
+
+    except Exception as e:
+        print(f"⚠️  Evaluation failed: {e}")
+        print("   You can run evaluation manually:")
+        print(f"   ./scripts/eval.sh --run-name {run_name} --dataset-name {dataset_name}")
+
+    # ============================================================================
+    # STEP 9: Summary
+    # ============================================================================
+
+    print(f"\n{'='*80}")
+    print("🎉 TRAINING & EVALUATION COMPLETE!")
     print(f"{'='*80}\n")
 
     print(f"Run name: {run_name}")
+    print(f"Dataset: {dataset_name}")
     print(f"Checkpoints: {output_dir}")
     print(f"Logs: {log_dir}")
+    print(f"Train loss: {train_result.training_loss:.4f}")
+    print(f"Total steps: {train_result.global_step}")
+    if eval_result:
+        print(f"\nEval accuracy: {eval_result['accuracy']['overall']:.1f}%")
+        print(f"Eval report: /moe-data/datasets/{base_dataset_name}/eval-report.json")
     print(f"\nTo use this model for inference:")
     print(f"  modal run modal/inference.py --checkpoint-name {run_name}/final")
+    print(f"\nTo download eval report locally:")
+    print(f"  uvx modal volume get moe-lora-data datasets/{base_dataset_name}/eval-report.json datasets/{base_dataset_name}/")
 
-    return {
+    result = {
         "run_name": run_name,
+        "dataset_name": dataset_name,
         "output_dir": output_dir,
         "train_loss": train_result.training_loss,
         "total_steps": train_result.global_step,
     }
+    if eval_result:
+        result["eval_accuracy"] = eval_result['accuracy']['overall']
+        result["eval_report_path"] = f"/moe-data/datasets/{base_dataset_name}/eval-report.json"
+
+    return result
 
 
 @app.function(

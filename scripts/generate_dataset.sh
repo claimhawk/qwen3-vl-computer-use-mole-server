@@ -5,17 +5,22 @@ set -euo pipefail
 # Auto-downloads locally and auto-starts preprocessing
 #
 # Usage:
-#   ./scripts/generate_dataset.sh [--dry] --train-tasks 1000 --eval-tasks 100
+#   ./scripts/generate_dataset.sh [--dry]
+
+# Production defaults:
+# - 1000 train total (balanced across 3 adapters)
+# - 100 val total (for early stopping during training)
+# - 100 eval total (held-out for final accuracy testing after training)
+TRAIN_TASKS=1000
+VAL_TASKS=100
+EVAL_TASKS=100
 
 DRY_RUN=false
-SCRIPT_ARGS=()
 
-# Parse args for --dry flag
+# Parse args
 for arg in "$@"; do
   if [[ "$arg" == "--dry" ]]; then
     DRY_RUN=true
-  else
-    SCRIPT_ARGS+=("$arg")
   fi
 done
 
@@ -26,15 +31,15 @@ echo ""
 
 if [[ "$DRY_RUN" == "true" ]]; then
   echo "[DRY RUN] Would execute:"
-  echo "  uvx modal run modal/generate_routing.py ${SCRIPT_ARGS[*]:-}"
+  echo "  uvx modal run modal/generate_routing.py --train-tasks $TRAIN_TASKS --val-tasks $VAL_TASKS --eval-tasks $EVAL_TASKS"
   echo ""
-  echo "[DRY RUN] On success, would auto-start:"
+  echo "Next step (run without --dry to auto-continue):"
   echo "  ./scripts/preprocess.sh --dataset-name datasets/<dataset_name>"
   exit 0
 fi
 
 # Execute dataset generation on Modal (downloads locally too)
-OUTPUT=$(uvx modal run modal/generate_routing.py "${SCRIPT_ARGS[@]:-}" 2>&1 | tee /dev/stderr)
+OUTPUT=$(uvx modal run modal/generate_routing.py --train-tasks "$TRAIN_TASKS" --val-tasks "$VAL_TASKS" --eval-tasks "$EVAL_TASKS" 2>&1 | tee /dev/stderr)
 
 if [[ $? -ne 0 ]]; then
   echo ""

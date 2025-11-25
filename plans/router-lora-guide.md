@@ -8,279 +8,162 @@
 Stack of independent layers:
 ├── Base: Qwen3-VL-8B-Instruct
 ├── Layer 1 (Router LoRA): Outputs "calendar" | "claim-window" | "provider-select"
-├── Layer 2 (Expert LoRAs): calendar, claim-window, provider-select, [chandra-ocr]
+├── Layer 2 (Expert LoRAs): calendar, claim-window, provider-select
 ```
 
-## Benefits
+## Current Implementation
 
-✅ Uses **existing LoRA training infrastructure** (zero new code!)
-✅ Router is just another adapter (same patterns as other experts)
-✅ Truly modular: layers don't interfere with each other
-✅ Easy to extend: add chandra-ocr by retraining router with 4th class
-✅ Simple inference: load router → classify → swap to expert
+### Volumes (Modal)
+- `moe-lora-data`: Routing datasets, checkpoints
+- `moe-lora-checkpoints`: Task LoRA adapters
+- `claimhawk-training-data`: Source training data
 
-## Dataset Preparation
-
-### 1. Generate routing dataset
-
-Already done:
+### Scripts
 ```bash
-datasets/routing_20251124_150334/
-├── train.jsonl (5,131 samples - 2,836 calendar, 1,200 claim-window, 1,200 provider-select)
-├── eval.jsonl (921 samples)
-└── images/
+scripts/generate_dataset.sh  # Generate routing dataset on Modal
+scripts/preprocess.sh        # Preprocess for training
+scripts/train.sh             # Train routing LoRA
+scripts/eval.sh              # Evaluate accuracy
 ```
 
-### 2. Convert to classification format
+### Modal Modules
+```bash
+modal/generate_routing.py    # Dataset generation from source volumes
+modal/preprocess.py          # Preprocessing
+modal/training.py            # LoRA training with SFTTrainer
+modal/eval.py                # Evaluation
+modal/stacked_inference.py   # Full pipeline: route → task LoRA → output
+```
+
+## Workflow
+
+### 1. Generate Routing Dataset
 
 ```bash
-python3 scripts/convert_routing_to_classification.py datasets/routing_20251124_150334
+./scripts/generate_dataset.sh
 ```
 
-Output:
-```bash
-datasets/routing_20251124_150334/
-├── train-classification.jsonl  # Model learns to output adapter names
-├── eval-classification.jsonl
-└── ...
+This runs `modal/generate_routing.py` which:
+- Reads from `claimhawk-training-data` volume (source datasets)
+- Creates balanced train/val/eval splits
+- Saves to `moe-lora-data` volume
+- Downloads locally for inspection
+
+**Output**: `datasets/routing_YYYYMMDD_HHMMSS/`
+```
+├── train.jsonl   # Training data
+├── val.jsonl     # Validation (early stopping)
+├── eval.jsonl    # Held-out evaluation
+├── images/       # Referenced screenshots
+└── metadata.json
 ```
 
-**Format example:**
+**Sample format**:
 ```json
 {
   "id": "claim-window_00447",
-  "image": "images/claim-window_00447.jpg",
+  "image": "images/claim-window_00447.png",
   "conversations": [
-    {
-      "from": "system",
-      "value": "You are a routing classifier for a multi-adapter system..."
-    },
-    {
-      "from": "human",
-      "value": "<image>\nWhich adapter should handle this screenshot?"
-    },
-    {
-      "from": "gpt",
-      "value": "provider-select"
-    }
-  ]
+    {"from": "system", "value": "You are a routing classifier..."},
+    {"from": "human", "value": "<image>\nWhich adapter should handle this?"},
+    {"from": "gpt", "value": "claim-window"}
+  ],
+  "metadata": {"adapter": "claim-window", "label": 1}
 }
 ```
 
-## Training the Router LoRA
-
-Use your **existing LoRA training script** (the one you used for calendar/claim-window):
+### 2. Preprocess Dataset
 
 ```bash
-# Point to your existing calendar training script location
-cd /path/to/trainers/calendar/qwenvl/train
-
-# Train router LoRA (same command as other adapters!)
-python train_qwen.py \
-  --model_name_or_path Qwen/Qwen3-VL-8B-Instruct \
-  --data_path /path/to/moe-lora/datasets/routing_20251124_150334/train-classification.jsonl \
-  --eval_data_path /path/to/moe-lora/datasets/routing_20251124_150334/eval-classification.jsonl \
-  --output_dir ./checkpoints/router-classifier \
-  --num_train_epochs 10 \
-  --per_device_train_batch_size 4 \
-  --per_device_eval_batch_size 4 \
-  --gradient_accumulation_steps 2 \
-  --evaluation_strategy "epoch" \
-  --save_strategy "epoch" \
-  --save_total_limit 3 \
-  --learning_rate 2e-4 \
-  --weight_decay 0.01 \
-  --warmup_ratio 0.03 \
-  --lr_scheduler_type "cosine" \
-  --logging_steps 10 \
-  --bf16 True \
-  --tf32 True \
-  --gradient_checkpointing True \
-  --dataloader_num_workers 4 \
-  --report_to "tensorboard"
+./scripts/preprocess.sh --dataset-name datasets/routing_YYYYMMDD_HHMMSS
 ```
 
-**Note**: Adjust paths and hyperparameters to match your existing training setup.
+### 3. Train Router LoRA
 
-## Inference
+```bash
+./scripts/train.sh --dataset-name datasets/routing_YYYYMMDD_HHMMSS --run-name my-routing-lora
+```
 
-### Architecture
+This runs `modal/training.py` using SFTTrainer to fine-tune a LoRA adapter.
+
+### 4. Evaluate
+
+```bash
+./scripts/eval.sh --run-name my-routing-lora --dataset-name datasets/routing_YYYYMMDD_HHMMSS
+```
+
+## Stacked Inference
+
+The full pipeline runs in `modal/stacked_inference.py`:
 
 ```python
-# Modular layer stack - each layer is independent
-base_model = "Qwen/Qwen3-VL-8B-Instruct"
-router_lora = "checkpoints/router-classifier"
-expert_loras = {
-    "calendar": "checkpoints/calendar-tasks",
-    "claim-window": "checkpoints/claim-window",
-    "provider-select": "checkpoints/provider-select",
-    # Future: "chandra-ocr": "checkpoints/chandra-ocr"
+# 1. Load routing LoRA
+routing_model = PeftModel.from_pretrained(base_model, routing_lora_path)
+
+# 2. Route: get adapter name
+adapter_name = generate(routing_model, image, prompt)  # "calendar"
+
+# 3. Load fresh base + task LoRA (fresh model to avoid adapter conflicts)
+task_base = Qwen3VLForConditionalGeneration.from_pretrained(...)
+task_model = PeftModel.from_pretrained(task_base, task_lora_path)
+
+# 4. Execute task
+result = generate(task_model, image, task_prompt)  # <tool_call>...</tool_call>
+```
+
+**Key insight**: Load a fresh base model for task inference to avoid PeftModel conflicts.
+
+### Running Stacked Inference
+
+```bash
+modal run modal/stacked_inference.py \
+  --routing-run routing-20251125-052946 \
+  --routing-dataset datasets/routing_20251125_052946 \
+  --max-samples 10
+```
+
+## Task LoRA Paths
+
+Defined in `config/loras.json`:
+```json
+{
+  "loras": {
+    "calendar": {"volume": "moe-lora-checkpoints", "path": "calendar-tasks"},
+    "claim-window": {"volume": "moe-lora-checkpoints", "path": "claim-window"},
+    "provider-select": {"volume": "moe-lora-checkpoints", "path": "provider-select"}
+  }
 }
 ```
 
-### Two-Stage Inference
+The inference code auto-detects `/final` subfolder for backwards compatibility.
 
-```python
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-from peft import PeftModel
+## Adding New Experts
 
-# Load base model
-model = Qwen3VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen3-VL-8B-Instruct",
-    torch_dtype=torch.bfloat16,
-    device_map="auto"
-)
-processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-8B-Instruct")
+### 1. Train the new task LoRA
+Use your existing training pipeline to create the new adapter.
 
-# Stage 1: Load router LoRA and classify
-model = PeftModel.from_pretrained(model, "checkpoints/router-classifier")
-model.eval()
-
-routing_prompt = [
-    {"role": "system", "content": "You are a routing classifier..."},
-    {"role": "user", "content": [
-        {"type": "image"},
-        {"type": "text", "text": "Which adapter should handle this screenshot?"}
-    ]}
-]
-
-inputs = processor(text=routing_prompt, images=[image], return_tensors="pt").to(model.device)
-output = model.generate(**inputs, max_new_tokens=20)
-adapter_name = processor.decode(output[0], skip_special_tokens=True).strip()
-# Returns: "calendar" or "claim-window" or "provider-select"
-
-# Stage 2: Unload router, load expert, run task
-model = model.unload()  # Remove router LoRA
-model = PeftModel.from_pretrained(model, f"checkpoints/{adapter_name}")
-
-# Now run the actual task with the expert adapter
-task_prompt = [{"role": "user", "content": [...]}]  # Your task prompt
-inputs = processor(text=task_prompt, images=[image], return_tensors="pt").to(model.device)
-output = model.generate(**inputs)
-result = processor.decode(output[0])
-```
-
-### Optimized Single-Load Inference
-
-```python
-# For production: keep base model loaded, swap adapters
-from peft import set_adapter
-
-# Load base once
-model = Qwen3VLForConditionalGeneration.from_pretrained(...)
-
-# Load all adapters
-model = PeftModel.from_pretrained(model, "checkpoints/router-classifier", adapter_name="router")
-model.load_adapter("checkpoints/calendar-tasks", adapter_name="calendar")
-model.load_adapter("checkpoints/claim-window", adapter_name="claim-window")
-model.load_adapter("checkpoints/provider-select", adapter_name="provider-select")
-
-# Classify with router
-model.set_adapter("router")
-adapter_name = classify(image)  # Returns adapter name
-
-# Execute with expert
-model.set_adapter(adapter_name)
-result = execute_task(image, prompt)
-```
-
-## Adding New Experts (e.g., chandra-ocr)
-
-### Step 1: Regenerate routing dataset with 4 classes
-
+### 2. Upload to Modal volume
 ```bash
-./scripts/generate_dataset.sh \
-  --train-images-calendar 27 \
-  --train-images-claim-window 3000 \
-  --train-images-provider-select 3000 \
-  --train-images-chandra-ocr 3000 \  # NEW
-  --eval-images 7 \
-  --train-val-split 0.98 \
-  --calendar-dataset ... \
-  --claim-window-dataset ... \
-  --provider-select-dataset ... \
-  --chandra-ocr-dataset ...  # NEW
+./scripts/save_lora.sh new-adapter /path/to/checkpoint
 ```
 
-### Step 2: Convert and retrain router
+### 3. Regenerate routing dataset with 4 classes
+Update `modal/generate_routing.py` ADAPTER_DATASETS to include new source.
 
+### 4. Retrain router
 ```bash
-python3 scripts/convert_routing_to_classification.py datasets/routing_NEW
-
-# Retrain router (same command as before, just new dataset)
-python train_qwen.py --data_path datasets/routing_NEW/train-classification.jsonl ...
+./scripts/generate_dataset.sh
+./scripts/preprocess.sh --dataset-name datasets/routing_NEW
+./scripts/train.sh --dataset-name datasets/routing_NEW --run-name routing-4way
 ```
 
-**Result**: Router now outputs 4 classes: `"calendar" | "claim-window" | "provider-select" | "chandra-ocr"`
+### 5. Update config/loras.json
+Add the new adapter path.
 
-### Step 3: Update inference
+## Results
 
-```python
-expert_loras = {
-    "calendar": "checkpoints/calendar-tasks",
-    "claim-window": "checkpoints/claim-window",
-    "provider-select": "checkpoints/provider-select",
-    "chandra-ocr": "checkpoints/chandra-ocr",  # NEW
-}
+Current performance (routing_20251125_052946):
+- **Routing accuracy**: 100% (9/9 on sample)
+- **Stacked inference**: 100% (all samples produce valid `<tool_call>` output)
 
-# Everything else stays the same!
-```
-
-## Comparison with Previous Approach
-
-| Aspect | Previous (Router Head) | New (Router LoRA) |
-|--------|----------------------|-------------------|
-| **Code complexity** | 500+ lines custom training | 0 new lines (reuses existing) |
-| **Training time** | Hours on GPU with preprocessing | Same as other LoRAs (~30 min) |
-| **Precision issues** | Multiple bfloat16/float32 bugs | None (standard LoRA training) |
-| **Batch handling** | Variable-length tensor issues | Standard batching works |
-| **Extensibility** | Add class, retrain head | Add class, retrain LoRA |
-| **Architecture** | Custom MLP head on frozen encoder | Standard LoRA adapter |
-| **Inference** | Load base + router head | Load base + router LoRA |
-| **Modularity** | Router coupled to base | Router is independent layer |
-
-## Validation
-
-### Expected Training Metrics
-
-- **Initial loss**: ~1.1 (random 3-class classification)
-- **Final loss**: ~0.1-0.3 (after 5-10 epochs)
-- **Eval accuracy**: >95% (balanced dataset)
-
-### Testing
-
-```python
-# Test router on validation set
-model.set_adapter("router")
-
-correct = 0
-total = 0
-
-for sample in validation_set:
-    predicted = classify(sample["image"])
-    actual = sample["conversations"][-1]["value"]  # Ground truth adapter name
-    if predicted == actual:
-        correct += 1
-    total += 1
-
-accuracy = correct / total
-print(f"Router accuracy: {accuracy:.2%}")
-```
-
-Expected: >95% accuracy
-
-## Summary
-
-**Router as LoRA** is the simplest, most maintainable approach:
-
-1. ✅ Zero new infrastructure (reuses existing LoRA training)
-2. ✅ True modularity (each layer is independent)
-3. ✅ Easy to extend (just retrain router with new class)
-4. ✅ No precision/batching issues (standard LoRA code handles it)
-5. ✅ Matches your existing patterns (calendar, claim-window, etc.)
-
-**Next steps:**
-1. Train router LoRA with existing training script
-2. Test classification accuracy on validation set
-3. Integrate into inference pipeline
-4. Add chandra-ocr when ready (retrain router + load 4th expert)
+**Last updated**: 2025-11-25

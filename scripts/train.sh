@@ -10,6 +10,7 @@ FAST_FLAG=""
 TEST_FLAG=""
 RUN_NAME=""
 DATASET_NAME=""
+DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -29,9 +30,13 @@ while [[ $# -gt 0 ]]; do
             DATASET_NAME="$2"
             shift 2
             ;;
+        --dry)
+            DRY_RUN=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 --run-name <NAME> --dataset-name <NAME> [--fast] [--test]"
+            echo "Usage: $0 --run-name <NAME> --dataset-name <NAME> [--fast] [--test] [--dry]"
             exit 1
             ;;
     esac
@@ -54,8 +59,18 @@ fi
 MODAL_CMD="uvx modal run -d modal/training.py --run-name $RUN_NAME --dataset-name $DATASET_NAME $FAST_FLAG $TEST_FLAG"
 
 echo "=================================="
-echo "Starting Modal Training (DETACHED)"
+echo "STAGE 3: Training"
 echo "=================================="
+echo ""
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[DRY RUN] Would execute:"
+    echo "  $MODAL_CMD"
+    echo ""
+    echo "(No next step - training is the final stage)"
+    exit 0
+fi
+
 echo "Command: $MODAL_CMD"
 echo ""
 

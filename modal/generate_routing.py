@@ -48,11 +48,17 @@ ADAPTER_LABELS = {
 )
 def generate_routing_dataset(
     train_tasks: int = 1000,
+    val_tasks: int = 100,
     eval_tasks: int = 100,
-    train_val_split: float = 0.8,
     seed: int = 42,
 ):
-    """Generate balanced routing dataset from 3 adapter sources."""
+    """Generate balanced routing dataset from 3 adapter sources.
+
+    Creates three separate splits:
+    - train.jsonl: Training data (train_tasks total, balanced across adapters)
+    - val.jsonl: Validation data used during training for early stopping (val_tasks total)
+    - eval.jsonl: Held-out evaluation data for final accuracy testing (eval_tasks total)
+    """
 
     rng = random.Random(seed)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -61,15 +67,22 @@ def generate_routing_dataset(
     images_dir = output_dir / "images"
     images_dir.mkdir(exist_ok=True)
 
+    # Per-adapter targets (divide by 3 adapters)
+    train_per_adapter = train_tasks // 3
+    val_per_adapter = val_tasks // 3
+    eval_per_adapter = eval_tasks // 3
+
     print(f"\n{'='*70}")
     print(f"Generating BALANCED Routing Dataset")
     print(f"{'='*70}")
     print(f"Output: {output_dir}")
-    print(f"Train tasks per adapter: {train_tasks}")
-    print(f"Eval tasks per adapter: {eval_tasks}")
+    print(f"Train: {train_tasks} total ({train_per_adapter} per adapter)")
+    print(f"Val: {val_tasks} total ({val_per_adapter} per adapter) - for training early stopping")
+    print(f"Eval: {eval_tasks} total ({eval_per_adapter} per adapter) - held-out for final accuracy")
     print(f"{'='*70}\n")
 
     all_train_samples = []
+    all_val_samples = []
     all_eval_samples = []
 
     for adapter_name, dataset_name in ADAPTER_DATASETS.items():
@@ -130,35 +143,50 @@ def generate_routing_dataset(
 
             return task_copy
 
-        # Collect train tasks - iterate through images, grab ALL tasks from each image
+        # Collect samples - iterate through images, grab ALL tasks from each image
+        # Split into train, val, eval using separate image pools (no leakage)
         train_samples = []
-        train_images_used = []
+        val_samples = []
+        eval_samples = []
+        images_used = {"train": [], "val": [], "eval": []}
+
+        # First pass: collect train samples
         for img in image_list:
-            if len(train_samples) >= train_tasks:
+            if len(train_samples) >= train_per_adapter:
                 break
-            # Add ALL tasks from this image
             for task in tasks_by_image[img]:
                 train_samples.append(convert_to_routing_sample(task, adapter_name, label))
-            train_images_used.append(img)
+            images_used["train"].append(img)
 
-        # Collect eval tasks from remaining images
-        eval_samples = []
+        # Second pass: collect val samples from remaining images
         for img in image_list:
-            if img in train_images_used:
+            if img in images_used["train"]:
                 continue
-            if len(eval_samples) >= eval_tasks:
+            if len(val_samples) >= val_per_adapter:
+                break
+            for task in tasks_by_image[img]:
+                val_samples.append(convert_to_routing_sample(task, adapter_name, label))
+            images_used["val"].append(img)
+
+        # Third pass: collect eval samples from remaining images
+        for img in image_list:
+            if img in images_used["train"] or img in images_used["val"]:
+                continue
+            if len(eval_samples) >= eval_per_adapter:
                 break
             for task in tasks_by_image[img]:
                 eval_samples.append(convert_to_routing_sample(task, adapter_name, label))
+            images_used["eval"].append(img)
 
         all_train_samples.extend(train_samples)
+        all_val_samples.extend(val_samples)
         all_eval_samples.extend(eval_samples)
 
-        print(f"  {adapter_name:20s} -> train={len(train_samples):4d} (from {len(train_images_used)} images), eval={len(eval_samples):4d}")
+        print(f"  {adapter_name:20s} -> train={len(train_samples):4d}, val={len(val_samples):4d}, eval={len(eval_samples):4d}")
 
         # Copy images
         images_copied = set()
-        for sample in train_samples + eval_samples:
+        for sample in train_samples + val_samples + eval_samples:
             img_path = sample.get("image", "")
             if img_path:
                 img_name = Path(img_path).name
@@ -176,24 +204,20 @@ def generate_routing_dataset(
                     images_copied.add(img_name)
                 sample["image"] = f"images/{img_name}"
 
-    # Shuffle combined dataset
+    # Shuffle all splits
     rng.shuffle(all_train_samples)
+    rng.shuffle(all_val_samples)
     rng.shuffle(all_eval_samples)
 
-    # Split train into train/val
-    split_idx = int(len(all_train_samples) * train_val_split)
-    train_data = all_train_samples[:split_idx]
-    val_data = all_train_samples[split_idx:]
-
     print(f"\nTotal samples:")
-    print(f"  Train: {len(train_data)}")
-    print(f"  Val: {len(val_data)}")
-    print(f"  Eval: {len(all_eval_samples)}")
+    print(f"  Train: {len(all_train_samples)} (for training)")
+    print(f"  Val: {len(all_val_samples)} (for early stopping during training)")
+    print(f"  Eval: {len(all_eval_samples)} (held-out for final accuracy)")
 
     # Check balance
     print(f"\nLabel distribution (train):")
     dist = {}
-    for s in train_data:
+    for s in all_train_samples:
         a = s["metadata"]["adapter"]
         dist[a] = dist.get(a, 0) + 1
     for a, c in sorted(dist.items()):
@@ -206,10 +230,10 @@ def generate_routing_dataset(
                 f.write(json.dumps(item) + "\n")
         print(f"  Saved {len(data)} to {path.name}")
 
-    all_data = train_data + val_data + all_eval_samples
+    all_data = all_train_samples + all_val_samples + all_eval_samples
     save_jsonl(output_dir / "data.jsonl", all_data)
-    save_jsonl(output_dir / "train.jsonl", train_data)
-    save_jsonl(output_dir / "val.jsonl", val_data)
+    save_jsonl(output_dir / "train.jsonl", all_train_samples)
+    save_jsonl(output_dir / "val.jsonl", all_val_samples)
     save_jsonl(output_dir / "eval.jsonl", all_eval_samples)
 
     # Metadata
@@ -217,9 +241,8 @@ def generate_routing_dataset(
         "dataset_name": "routing",
         "created_at": datetime.now().isoformat(),
         "seed": seed,
-        "train_val_split": train_val_split,
         "adapters": {name: {"label": ADAPTER_LABELS[name], "source": ds} for name, ds in ADAPTER_DATASETS.items()},
-        "samples": {"train": len(train_data), "val": len(val_data), "eval": len(all_eval_samples)},
+        "samples": {"train": len(all_train_samples), "val": len(all_val_samples), "eval": len(all_eval_samples)},
         "label_distribution_train": dist,
     }
     with open(output_dir / "metadata.json", "w") as f:
@@ -238,8 +261,8 @@ def generate_routing_dataset(
 @app.local_entrypoint()
 def main(
     train_tasks: int = 1000,
+    val_tasks: int = 100,
     eval_tasks: int = 100,
-    train_val_split: float = 0.8,
     seed: int = 42,
 ):
     import subprocess
@@ -247,8 +270,8 @@ def main(
 
     dataset_name = generate_routing_dataset.remote(
         train_tasks=train_tasks,
+        val_tasks=val_tasks,
         eval_tasks=eval_tasks,
-        train_val_split=train_val_split,
         seed=seed,
     )
     print(f"\nGenerated: {dataset_name}")
