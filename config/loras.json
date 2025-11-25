@@ -1,3 +1,19 @@
 {
-  "loras": {}
+  "loras": {
+    "calendar": {
+      "volume": "moe-lora-checkpoints",
+      "path": "calendar-tasks",
+      "dataset": "mike-im-day-clicks-system-prompt-8B_20251120_180854"
+    },
+    "claim-window": {
+      "volume": "moe-lora-checkpoints",
+      "path": "claim-window",
+      "dataset": "claim-window_20251123_221931"
+    },
+    "provider-select": {
+      "volume": "moe-lora-checkpoints",
+      "path": "provider-select",
+      "dataset": "select-provider-dropdown_20251123_191451"
+    }
+  }
 }
