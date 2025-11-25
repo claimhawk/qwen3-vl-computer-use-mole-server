@@ -1,0 +1,128 @@
+\begin{thebibliography}{24}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[An et~al.(2022)An, Li, Lin, Liu, Chen, Fu, Chen, Zheng, and Lou]{an2022input}
+Shengnan An, Yifei Li, Zeqi Lin, Qian Liu, Bei Chen, Qiang Fu, Weizhu Chen, Nanning Zheng, and Jian-Guang Lou.
+\newblock Input-tuning: Adapting unfamiliar inputs to frozen pretrained models.
+\newblock \emph{arXiv preprint arXiv:2203.03131}, 2022.
+
+\bibitem[Chung et~al.(2022)Chung, Hou, Longpre, Zoph, Tay, Fedus, Li, Wang, Dehghani, Brahma, et~al.]{flant5}
+Hyung~Won Chung, Le~Hou, Shayne Longpre, Barret Zoph, Yi~Tay, William Fedus, Eric Li, Xuezhi Wang, Mostafa Dehghani, Siddhartha Brahma, et~al.
+\newblock Scaling instruction-finetuned language models.
+\newblock \emph{arXiv preprint arXiv:2210.11416}, 2022.
+
+\bibitem[Gal et~al.(2022{\natexlab{a}})Gal, Alaluf, Atzmon, Patashnik, Bermano, Chechik, and Cohen-Or]{TI}
+Rinon Gal, Yuval Alaluf, Yuval Atzmon, Or~Patashnik, Amit~H Bermano, Gal Chechik, and Daniel Cohen-Or.
+\newblock An image is worth one word: Personalizing text-to-image generation using textual inversion.
+\newblock \emph{arXiv preprint arXiv:2208.01618}, 2022{\natexlab{a}}.
+
+\bibitem[Gal et~al.(2022{\natexlab{b}})Gal, Alaluf, Atzmon, Patashnik, Bermano, Chechik, and Cohen-Or]{gal2022image}
+Rinon Gal, Yuval Alaluf, Yuval Atzmon, Or~Patashnik, Amit~H Bermano, Gal Chechik, and Daniel Cohen-Or.
+\newblock An image is worth one word: Personalizing text-to-image generation using textual inversion.
+\newblock \emph{arXiv preprint arXiv:2208.01618}, 2022{\natexlab{b}}.
+
+\bibitem[Ghazal et~al.(2013)Ghazal, Rabl, Hu, Raab, Poess, Crolotte, and Jacobsen]{ghazal2013bigbench}
+Ahmad Ghazal, Tilmann Rabl, Minqing Hu, Francois Raab, Meikel Poess, Alain Crolotte, and Hans-Arno Jacobsen.
+\newblock Bigbench: Towards an industry standard benchmark for big data analytics.
+\newblock In \emph{Proceedings of the 2013 ACM SIGMOD international conference on Management of data}, pp.\  1197--1208, 2013.
+
+\bibitem[Gu et~al.(2023)Gu, Wang, Wu, Shi, Chen, Fan, Xiao, Zhao, Chang, Wu, et~al.]{gu2023mix}
+Yuchao Gu, Xintao Wang, Jay~Zhangjie Wu, Yujun Shi, Yunpeng Chen, Zihan Fan, Wuyou Xiao, Rui Zhao, Shuning Chang, Weijia Wu, et~al.
+\newblock Mix-of-show: Decentralized low-rank adaptation for multi-concept customization of diffusion models.
+\newblock \emph{arXiv preprint arXiv:2305.18292}, 2023.
+
+\bibitem[Han et~al.(2023)Han, Li, Zhang, Milanfar, Metaxas, and Yang]{han2023svdiff}
+Ligong Han, Yinxiao Li, Han Zhang, Peyman Milanfar, Dimitris Metaxas, and Feng Yang.
+\newblock Svdiff: Compact parameter space for diffusion fine-tuning.
+\newblock \emph{arXiv preprint arXiv:2303.11305}, 2023.
+
+\bibitem[Ho et~al.(2020)Ho, Jain, and Abbeel]{DDPM}
+Jonathan Ho, Ajay Jain, and Pieter Abbeel.
+\newblock Denoising diffusion probabilistic models.
+\newblock \emph{Advances in neural information processing systems}, 33:\penalty0 6840--6851, 2020.
+
+\bibitem[Hu et~al.(2021)Hu, Shen, Wallis, Allen-Zhu, Li, Wang, Wang, and Chen]{lora}
+Edward~J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu~Wang, and Weizhu Chen.
+\newblock Lora: Low-rank adaptation of large language models.
+\newblock \emph{arXiv preprint arXiv:2106.09685}, 2021.
+
+\bibitem[Huang et~al.(2023)Huang, Liu, Lin, Pang, Du, and Lin]{huang2023lorahub}
+Chengsong Huang, Qian Liu, Bill~Yuchen Lin, Tianyu Pang, Chao Du, and Min Lin.
+\newblock Lorahub: Efficient cross-task generalization via dynamic lora composition.
+\newblock \emph{arXiv preprint arXiv:2307.13269}, 2023.
+
+\bibitem[Kumari et~al.(2023)Kumari, Zhang, Zhang, Shechtman, and Zhu]{kumari2023multi}
+Nupur Kumari, Bingliang Zhang, Richard Zhang, Eli Shechtman, and Jun-Yan Zhu.
+\newblock Multi-concept customization of text-to-image diffusion.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition}, pp.\  1931--1941, 2023.
+
+\bibitem[Lester et~al.(2021)Lester, Al-Rfou, and Constant]{lester2021power}
+Brian Lester, Rami Al-Rfou, and Noah Constant.
+\newblock The power of scale for parameter-efficient prompt tuning.
+\newblock \emph{arXiv preprint arXiv:2104.08691}, 2021.
+
+\bibitem[Nie et~al.(2019)Nie, Williams, Dinan, Bansal, Weston, and Kiela]{ANLI}
+Yixin Nie, Adina Williams, Emily Dinan, Mohit Bansal, Jason Weston, and Douwe Kiela.
+\newblock Adversarial nli: A new benchmark for natural language understanding.
+\newblock \emph{arXiv preprint arXiv:1910.14599}, 2019.
+
+\bibitem[Radford et~al.(2021{\natexlab{a}})Radford, Kim, Hallacy, Ramesh, Goh, Agarwal, Sastry, Askell, Mishkin, Clark, et~al.]{clip}
+Alec Radford, Jong~Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry, Amanda Askell, Pamela Mishkin, Jack Clark, et~al.
+\newblock Learning transferable visual models from natural language supervision.
+\newblock In \emph{International conference on machine learning}, pp.\  8748--8763. PMLR, 2021{\natexlab{a}}.
+
+\bibitem[Radford et~al.(2021{\natexlab{b}})Radford, Kim, Hallacy, Ramesh, Goh, Agarwal, Sastry, Askell, Mishkin, Clark, et~al.]{radford2021learning}
+Alec Radford, Jong~Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry, Amanda Askell, Pamela Mishkin, Jack Clark, et~al.
+\newblock Learning transferable visual models from natural language supervision.
+\newblock In \emph{International conference on machine learning}, pp.\  8748--8763. PMLR, 2021{\natexlab{b}}.
+
+\bibitem[Rajpurkar et~al.(2018)Rajpurkar, Jia, and Liang]{QNLI}
+Pranav Rajpurkar, Robin Jia, and Percy Liang.
+\newblock Know what you don't know: Unanswerable questions for squad.
+\newblock \emph{arXiv preprint arXiv:1806.03822}, 2018.
+
+\bibitem[Ramesh et~al.(2022)Ramesh, Dhariwal, Nichol, Chu, and Chen]{dell2}
+Aditya Ramesh, Prafulla Dhariwal, Alex Nichol, Casey Chu, and Mark Chen.
+\newblock Hierarchical text-conditional image generation with clip latents.
+\newblock \emph{arXiv preprint arXiv:2204.06125}, 1:\penalty0 3, 2022.
+
+\bibitem[Ruiz et~al.(2023)Ruiz, Li, Jampani, Pritch, Rubinstein, and Aberman]{ruiz2023dreambooth}
+Nataniel Ruiz, Yuanzhen Li, Varun Jampani, Yael Pritch, Michael Rubinstein, and Kfir Aberman.
+\newblock Dreambooth: Fine tuning text-to-image diffusion models for subject-driven generation.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition}, pp.\  22500--22510, 2023.
+
+\bibitem[Sung et~al.(2022)Sung, Cho, and Bansal]{sung2022vl}
+Yi-Lin Sung, Jaemin Cho, and Mohit Bansal.
+\newblock Vl-adapter: Parameter-efficient transfer learning for vision-and-language tasks.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition}, pp.\  5227--5237, 2022.
+
+\bibitem[Touvron et~al.(2023)Touvron, Lavril, Izacard, Martinet, Lachaux, Lacroix, Rozi{\`e}re, Goyal, Hambro, Azhar, et~al.]{llama}
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timoth{\'e}e Lacroix, Baptiste Rozi{\`e}re, Naman Goyal, Eric Hambro, Faisal Azhar, et~al.
+\newblock Llama: Open and efficient foundation language models.
+\newblock \emph{arXiv preprint arXiv:2302.13971}, 2023.
+
+\bibitem[Voynov et~al.(2023)Voynov, Chu, Cohen-Or, and Aberman]{voynov2023p+}
+Andrey Voynov, Qinghao Chu, Daniel Cohen-Or, and Kfir Aberman.
+\newblock $ p+ $: Extended textual conditioning in text-to-image generation.
+\newblock \emph{arXiv preprint arXiv:2303.09522}, 2023.
+
+\bibitem[Xie et~al.(2023)Xie, Huang, Chen, and Wei]{moec}
+Yuan Xie, Shaohan Huang, Tianyu Chen, and Furu Wei.
+\newblock Moec: Mixture of expert clusters.
+\newblock In \emph{Proceedings of the AAAI Conference on Artificial Intelligence}, volume~37, pp.\  13807--13815, 2023.
+
+\bibitem[Zhang et~al.(2023)Zhang, Chen, Liu, and He]{zhang2023composing}
+Jinghan Zhang, Shiqi Chen, Junteng Liu, and Junxian He.
+\newblock Composing parameter-efficient modules with arithmetic operations.
+\newblock \emph{arXiv preprint arXiv:2306.14870}, 2023.
+
+\bibitem[Zhang et~al.(2022)Zhang, Roller, Goyal, Artetxe, Chen, Chen, Dewan, Diab, Li, Lin, et~al.]{opt}
+Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christopher Dewan, Mona Diab, Xian Li, Xi~Victoria Lin, et~al.
+\newblock Opt: Open pre-trained transformer language models.
+\newblock \emph{arXiv preprint arXiv:2205.01068}, 2022.
+
+\end{thebibliography}

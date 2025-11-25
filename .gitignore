@@ -1,0 +1,8 @@
+output/
+datasets/
+logs/
+*.log
+.env
+.env.*
+!.env.example
+archives/
