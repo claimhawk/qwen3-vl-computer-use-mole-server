@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Generate routing dataset and optionally auto-start upload
+# Generate routing dataset on Modal from existing datasets on Modal volumes
+# Auto-downloads locally and auto-starts preprocessing
 #
 # Usage:
-#   ./scripts/generate_dataset.sh [--dry] --train-images 100 \
-#     --calendar-dataset /path/to/cal/train.jsonl \
-#     --claim-window-dataset /path/to/claim/train.jsonl \
-#     --provider-select-dataset /path/to/provider/train.jsonl
+#   ./scripts/generate_dataset.sh [--dry] --train-tasks 1000 --eval-tasks 100
 
 DRY_RUN=false
 SCRIPT_ARGS=()
@@ -28,15 +26,15 @@ echo ""
 
 if [[ "$DRY_RUN" == "true" ]]; then
   echo "[DRY RUN] Would execute:"
-  echo "  python3 scripts/generate_routing_data.py ${SCRIPT_ARGS[*]}"
+  echo "  uvx modal run modal/generate_routing.py ${SCRIPT_ARGS[*]:-}"
   echo ""
-  echo "[DRY RUN] On success, would run:"
-  echo "  ./scripts/upload_dataset.sh <dataset_name>"
+  echo "[DRY RUN] On success, would auto-start:"
+  echo "  ./scripts/preprocess.sh --dataset-name datasets/<dataset_name>"
   exit 0
 fi
 
-# Execute dataset generation
-python3 scripts/generate_routing_data.py "${SCRIPT_ARGS[@]}"
+# Execute dataset generation on Modal (downloads locally too)
+OUTPUT=$(uvx modal run modal/generate_routing.py "${SCRIPT_ARGS[@]:-}" 2>&1 | tee /dev/stderr)
 
 if [[ $? -ne 0 ]]; then
   echo ""
@@ -44,24 +42,21 @@ if [[ $? -ne 0 ]]; then
   exit 1
 fi
 
-# Extract dataset name from most recent dataset directory
-DATASET_DIR=$(ls -td datasets/routing_* 2>/dev/null | head -1)
+# Extract dataset name from output
+DATASET_NAME=$(echo "$OUTPUT" | grep -oE 'routing_[0-9]{8}_[0-9]{6}' | tail -1)
 
-if [[ -z "$DATASET_DIR" ]]; then
+if [[ -z "$DATASET_NAME" ]]; then
   echo ""
-  echo "❌ Could not find generated dataset directory"
+  echo "❌ Could not extract dataset name from output"
   exit 1
 fi
-
-DATASET_NAME=$(basename "$DATASET_DIR")
 
 echo ""
 echo "✅ Dataset generated: $DATASET_NAME"
 echo ""
 echo "========================================"
-echo "Auto-starting upload..."
+echo "Auto-starting preprocessing..."
 echo "========================================"
 echo ""
 
-# Auto-start upload (without --dry)
-exec ./scripts/upload_dataset.sh "$DATASET_NAME"
+exec ./scripts/preprocess.sh --dataset-name "datasets/$DATASET_NAME"

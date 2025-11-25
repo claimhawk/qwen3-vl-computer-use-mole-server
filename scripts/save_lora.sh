@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
 # Copy a LoRA checkpoint into a Modal volume for sharing across apps.
-# Supports uploading from local disk or copying from one Modal volume to another.
+# Updates config/loras.json to track LoRAs locally.
+#
 # Usage:
 #   # upload local -> volume
-#   scripts/save_lora.sh --checkpoint /path/to/ckpt --name calendar-tasks [--volume claimhawk-checkpoints] [--dest subdir/in/volume]
+#   scripts/save_lora.sh --checkpoint /path/to/ckpt --name calendar-tasks [--dataset datasets/xyz] [--volume moe-lora-checkpoints]
 #   # copy within Modal volumes (no local checkpoint)
-#   scripts/save_lora.sh --from-volume claimhawk-checkpoints --checkpoint mike-im-day-clicks-system-prompt-8B_20251120_180854/mike-day-clicks-graduated-8b/checkpoint-40 --name calendar-tasks [--volume claimhawk-checkpoints] [--dest subdir]
+#   scripts/save_lora.sh --from-volume claimhawk-checkpoints --checkpoint path/to/checkpoint-40 --name calendar-tasks [--dataset datasets/xyz]
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+CONFIG_FILE="$ROOT_DIR/config/loras.json"
 
 VOLUME="moe-lora-checkpoints"
 DEST=""
 NAME=""
 FROM_VOLUME=""
+DATASET=""
+CHECKPOINT=""
 
 usage() {
-    echo "Usage: $0 --checkpoint <path_or_volume_path> --name <id> [--volume ${VOLUME}] [--dest subdir/in/volume] [--from-volume <vol>]" >&2
+    echo "Usage: $0 --checkpoint <path_or_volume_path> --name <id> [--dataset <dataset_path>] [--volume ${VOLUME}] [--dest subdir] [--from-volume <vol>]" >&2
     exit 1
 }
 
@@ -31,6 +38,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --name)
             NAME="${2:-}"
+            shift 2
+            ;;
+        --dataset)
+            DATASET="${2:-}"
             shift 2
             ;;
         --volume)
@@ -74,6 +85,52 @@ if [[ -z "$DEST" ]]; then
     DEST="$NAME"
 fi
 
+# Ensure config file exists
+mkdir -p "$(dirname "$CONFIG_FILE")"
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo '{"loras": {}}' > "$CONFIG_FILE"
+fi
+
+update_config() {
+    local name="$1"
+    local volume="$2"
+    local dest="$3"
+    local checkpoint="$4"
+    local dataset="${5:-}"
+    local from_vol="${6:-}"
+    local timestamp
+    timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+    # Build the JSON entry
+    local source_checkpoint="$checkpoint"
+    if [[ -n "$from_vol" ]]; then
+        source_checkpoint="$from_vol:$checkpoint"
+    fi
+
+    # Use Python to update JSON (more reliable than jq for complex updates)
+    python3 << EOF
+import json
+from pathlib import Path
+
+config_path = Path("$CONFIG_FILE")
+config = json.loads(config_path.read_text())
+
+config["loras"]["$name"] = {
+    "volume": "$volume",
+    "path": "$dest",
+    "source_checkpoint": "$source_checkpoint",
+    "dataset": "$dataset" if "$dataset" else None,
+    "saved_at": "$timestamp"
+}
+
+# Remove None values
+config["loras"]["$name"] = {k: v for k, v in config["loras"]["$name"].items() if v is not None}
+
+config_path.write_text(json.dumps(config, indent=2) + "\n")
+print(f"Updated {config_path}")
+EOF
+}
+
 if [[ -n "$FROM_VOLUME" ]]; then
     TMP_DIR="$(mktemp -d)"
     echo "Copying checkpoint via get/put:"
@@ -89,6 +146,10 @@ if [[ -n "$FROM_VOLUME" ]]; then
     fi
     $MODAL_BIN volume put "$VOLUME" "$SRC_PATH" "$DEST"
     rm -rf "$TMP_DIR"
+
+    # Update config
+    update_config "$NAME" "$VOLUME" "$DEST" "$CHECKPOINT" "$DATASET" "$FROM_VOLUME"
+
     echo "Done."
     exit 0
 fi
@@ -108,5 +169,8 @@ echo "  dest:     $DEST"
 echo
 
 $MODAL_BIN volume put "$VOLUME" "$CHECKPOINT" "$DEST"
+
+# Update config
+update_config "$NAME" "$VOLUME" "$DEST" "$CHECKPOINT" "$DATASET" ""
 
 echo "Done."

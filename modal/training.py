@@ -100,10 +100,6 @@ def train_qwen3vl_lora(
     save_steps: int = 20,
     # Early stopping (None = auto-tune)
     patience: int = None,
-    # Loss weighting (graduated weighting for tool_call only supervision)
-    base_weight: float = 1.0,    # All tokens inside <tool_call> (ensures full coverage)
-    action_weight: float = 1.5,  # Action name tokens (1.5x base weight)
-    arg_weight: float = 2.0,     # Critical argument tokens (2.0x base weight)
     # Fast mode
     fast: bool = False,
     # Model
@@ -1251,11 +1247,8 @@ def train_qwen3vl_lora(
     # Collator following official Qwen3-VL pattern
     @dataclass
     class DataCollatorForSupervisedDataset:
-        """Collate examples for supervised fine-tuning with graduated loss weights."""
+        """Collate examples for supervised fine-tuning."""
         processor: Any
-        base_weight: float = 1.0
-        action_weight: float = 1.5
-        arg_weight: float = 2.0
 
         def __call__(self, instances):
             """
@@ -1320,59 +1313,8 @@ def train_qwen3vl_lora(
                     shapes = [tuple(t.shape) for t in grid_list]
                     raise RuntimeError(f"Failed to concatenate image_grid_thw; shapes={shapes}") from err
 
-            # Graduated loss weights for tool_call content
-            # Base weight applies to ALL tokens in <tool_call> blocks
-            # Action weight overlays on "action" field tokens
-            # Arg weight overlays on argument field tokens (coordinate, text, etc.)
-
-            TOOL_CALL_START = 151657  # <tool_call>
-            TOOL_CALL_END = 151658    # </tool_call>
-
-            # Initialize with zeros (no loss on ignored tokens)
-            loss_weights = torch.zeros_like(labels_padded, dtype=torch.float32)
-
-            # Process each sample in batch
-            for batch_idx in range(labels_padded.shape[0]):
-                sample_labels = labels_padded[batch_idx]
-                sample_weights = loss_weights[batch_idx]
-
-                # Find all <tool_call> blocks in this sample
-                i = 0
-                while i < len(sample_labels):
-                    if sample_labels[i] == TOOL_CALL_START:
-                        # Found <tool_call> - apply base_weight to ALL tokens until </tool_call>
-                        start_idx = i
-                        end_idx = i + 1
-
-                        # Find matching </tool_call>
-                        while end_idx < len(sample_labels) and sample_labels[end_idx] != TOOL_CALL_END:
-                            end_idx += 1
-
-                        if end_idx < len(sample_labels):
-                            # Apply base_weight to entire tool_call block (including tags)
-                            sample_weights[start_idx:end_idx+1] = self.base_weight
-
-                            # Now overlay higher weights on action and argument fields
-                            # Look for JSON structure: {"name": "computer_use", "arguments": {...}}
-                            block_start = start_idx + 1  # Skip <tool_call> tag
-                            block_labels = sample_labels[block_start:end_idx]
-
-                            # Simple heuristic: tokens after "action" or "coordinate", "text", etc. get higher weights
-                            # For now, use position-based heuristic:
-                            # - First ~20% of tokens after opening brace: action field (action_weight)
-                            # - Remaining tokens: arguments (arg_weight)
-
-                            block_len = len(block_labels)
-                            if block_len > 10:  # Only apply if block is substantial
-                                # First 20% after opening JSON: action name field
-                                action_field_end = min(block_start + int(block_len * 0.2), block_start + 20)
-                                sample_weights[block_start:action_field_end] = self.action_weight
-
-                                # Remaining: arguments (highest weight)
-                                sample_weights[action_field_end:end_idx] = self.arg_weight
-
-                            i = end_idx
-                    i += 1
+            # Uniform loss weights: 1.0 for all non-ignored tokens
+            loss_weights = (labels_padded != -100).float()
 
             # Build batch dict
             batch = {
@@ -1388,18 +1330,7 @@ def train_qwen3vl_lora(
 
             return batch
 
-    # Instantiate the collator
-    print(f"\n📊 Loss weighting (graduated on tool_call content):")
-    print(f"   base_weight: {base_weight} (all tokens in <tool_call> blocks)")
-    print(f"   action_weight: {action_weight} (action name field)")
-    print(f"   arg_weight: {arg_weight} (argument fields)")
-
-    data_collator = DataCollatorForSupervisedDataset(
-        processor=processor,
-        base_weight=base_weight,
-        action_weight=action_weight,
-        arg_weight=arg_weight,
-    )
+    data_collator = DataCollatorForSupervisedDataset(processor=processor)
 
     eval_example_logger = EvalExampleLogger(
         tokenizer=processor.tokenizer,

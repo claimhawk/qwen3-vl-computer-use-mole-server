@@ -48,7 +48,7 @@ echo "Checking ${#PY_FILES[@]} Python files..."
 "${PYRUNNER[@]}" -m ruff check "${PY_FILES[@]}"
 
 # Docstring enforcement
-"${PYRUNNER[@]}" scripts/check_docstrings.py "${PY_FILES[@]}"
+"${PYRUNNER[@]}" utils/check_docstrings.py "${PY_FILES[@]}"
 
 # Mypy (ignore missing imports to accommodate external deps)
 "${PYRUNNER[@]}" -m mypy --config-file mypy.ini "${PY_FILES[@]}"

@@ -83,73 +83,104 @@ def generate_routing_dataset(
             print(f"  ERROR: {dataset_path} not found!")
             continue
 
-        # Load and group by image
-        samples_by_image = {}
+        # Group tasks by image
+        tasks_by_image = {}
         with open(dataset_path) as f:
             for line in f:
                 if line.strip():
                     sample = json.loads(line)
                     img = sample.get("image", "")
                     if img:
-                        if img not in samples_by_image:
-                            samples_by_image[img] = []
-                        samples_by_image[img].append(sample)
+                        if img not in tasks_by_image:
+                            tasks_by_image[img] = []
+                        tasks_by_image[img].append(sample)
 
-        # Shuffle images
-        images = list(samples_by_image.keys())
-        rng.shuffle(images)
+        # Shuffle image order
+        image_list = list(tasks_by_image.keys())
+        rng.shuffle(image_list)
 
-        # Collect train tasks
+        total_tasks = sum(len(tasks) for tasks in tasks_by_image.values())
+        print(f"  Total images: {len(image_list)}, Total tasks: {total_tasks}")
+
+        def convert_to_routing_sample(task, adapter_name, label):
+            """Convert task to routing format: keep system+human, replace gpt with adapter name."""
+            # Only keep essential fields
+            task_copy = {
+                "id": task.get("id", ""),
+                "image": task.get("image", ""),
+                "metadata": {
+                    "adapter": adapter_name,
+                    "label": label,
+                },
+            }
+
+            # Filter conversations: keep system and human, replace gpt with adapter name
+            if "conversations" in task:
+                new_convs = []
+                for conv in task["conversations"]:
+                    if conv["from"] == "system":
+                        new_convs.append(conv)
+                    elif conv["from"] == "human":
+                        new_convs.append(conv)
+                    elif conv["from"] == "gpt":
+                        # Replace with adapter name as the response
+                        new_convs.append({"from": "gpt", "value": adapter_name})
+                        break  # Only keep first response
+                task_copy["conversations"] = new_convs
+
+            return task_copy
+
+        # Collect train tasks - iterate through images, grab ALL tasks from each image
         train_samples = []
-        train_images_used = set()
-        for img in images:
+        train_images_used = []
+        for img in image_list:
             if len(train_samples) >= train_tasks:
                 break
-            for sample in samples_by_image[img]:
-                sample_copy = sample.copy()
-                sample_copy["adapter"] = adapter_name
-                sample_copy["label"] = label
-                train_samples.append(sample_copy)
-            train_images_used.add(img)
+            # Add ALL tasks from this image
+            for task in tasks_by_image[img]:
+                train_samples.append(convert_to_routing_sample(task, adapter_name, label))
+            train_images_used.append(img)
 
-        # Collect eval tasks (exclude train images)
+        # Collect eval tasks from remaining images
         eval_samples = []
-        for img in images:
+        for img in image_list:
             if img in train_images_used:
                 continue
             if len(eval_samples) >= eval_tasks:
                 break
-            for sample in samples_by_image[img]:
-                sample_copy = sample.copy()
-                sample_copy["adapter"] = adapter_name
-                sample_copy["label"] = label
-                eval_samples.append(sample_copy)
+            for task in tasks_by_image[img]:
+                eval_samples.append(convert_to_routing_sample(task, adapter_name, label))
 
         all_train_samples.extend(train_samples)
         all_eval_samples.extend(eval_samples)
 
-        print(f"  {adapter_name:20s} -> train={len(train_samples):4d}, eval={len(eval_samples):4d}")
+        print(f"  {adapter_name:20s} -> train={len(train_samples):4d} (from {len(train_images_used)} images), eval={len(eval_samples):4d}")
 
         # Copy images
+        images_copied = set()
         for sample in train_samples + eval_samples:
             img_path = sample.get("image", "")
             if img_path:
-                # Handle different image path formats
                 img_name = Path(img_path).name
+                if img_name in images_copied:
+                    sample["image"] = f"images/{img_name}"
+                    continue
+
                 src = source_images_dir / img_name
                 if not src.exists():
-                    # Try with full path
                     src = Path(f"/training-data/{dataset_name}") / img_path
                 if src.exists():
                     dst = images_dir / img_name
                     if not dst.exists():
                         shutil.copy2(src, dst)
-                    sample["image"] = f"images/{img_name}"
+                    images_copied.add(img_name)
+                sample["image"] = f"images/{img_name}"
 
-    # Shuffle and split
+    # Shuffle combined dataset
     rng.shuffle(all_train_samples)
     rng.shuffle(all_eval_samples)
 
+    # Split train into train/val
     split_idx = int(len(all_train_samples) * train_val_split)
     train_data = all_train_samples[:split_idx]
     val_data = all_train_samples[split_idx:]
@@ -163,7 +194,7 @@ def generate_routing_dataset(
     print(f"\nLabel distribution (train):")
     dist = {}
     for s in train_data:
-        a = s["adapter"]
+        a = s["metadata"]["adapter"]
         dist[a] = dist.get(a, 0) + 1
     for a, c in sorted(dist.items()):
         print(f"  {a}: {c}")
@@ -211,6 +242,9 @@ def main(
     train_val_split: float = 0.8,
     seed: int = 42,
 ):
+    import subprocess
+    from pathlib import Path
+
     dataset_name = generate_routing_dataset.remote(
         train_tasks=train_tasks,
         eval_tasks=eval_tasks,
@@ -218,4 +252,16 @@ def main(
         seed=seed,
     )
     print(f"\nGenerated: {dataset_name}")
-    print(f"Next: ./scripts/preprocess.sh --dataset-name datasets/{dataset_name}")
+
+    # Download to local ./datasets/ for inspection
+    local_dir = Path(f"datasets/{dataset_name}")
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nDownloading to {local_dir}...")
+    subprocess.run(
+        ["uvx", "modal", "volume", "get", "moe-lora-data", f"datasets/{dataset_name}", str(local_dir.parent)],
+        check=True,
+    )
+    print(f"Downloaded to: {local_dir}")
+
+    print(f"\nNext: ./scripts/preprocess.sh --dataset-name datasets/{dataset_name}")

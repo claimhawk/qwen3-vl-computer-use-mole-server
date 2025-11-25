@@ -1,7 +1,7 @@
 #!/bin/bash
-# Preprocess Qwen3-VL datasets on Modal, then auto-start training.
+# Preprocess Qwen3-VL datasets on Modal.
 #
-# Pipeline: generate_dataset.sh -> upload_dataset.sh -> preprocess.sh -> train_router.sh
+# Pipeline: generate_dataset.sh -> preprocess.sh -> train.sh
 
 set -euo pipefail
 
@@ -27,7 +27,7 @@ if [[ -z "$DATASET_NAME" ]]; then
 fi
 
 echo "========================================"
-echo "STAGE 3: Preprocess Dataset"
+echo "STAGE 2: Preprocess Dataset"
 echo "========================================"
 echo ""
 echo "Dataset: $DATASET_NAME"
@@ -52,13 +52,4 @@ fi
 echo ""
 echo "✅ Preprocessing complete: $DATASET_NAME"
 echo ""
-echo "========================================"
-echo "Auto-starting LoRA training..."
-echo "========================================"
-echo ""
-
-# Extract just the dataset folder name (e.g., "routing_20251124_172521" from "datasets/routing_20251124_172521")
-DATASET_FOLDER=$(basename "$DATASET_NAME")
-
-# Auto-start training
-exec ./scripts/train_router.sh "$DATASET_FOLDER"
+echo "Next: ./scripts/train.sh --dataset-name $DATASET_NAME --run-name <run_name>"
