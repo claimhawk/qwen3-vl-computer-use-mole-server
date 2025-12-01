@@ -24,18 +24,96 @@ moe_volume = modal.Volume.from_name("moe-lora-data", create_if_missing=True)
 
 image = modal.Image.debian_slim(python_version="3.12")
 
-# Dataset mappings
-ADAPTER_DATASETS = {
-    "calendar": "mike-im-day-clicks-system-prompt-8B_20251120_180854",
-    "claim-window": "claim-window_20251123_221931",
-    "provider-select": "select-provider-dropdown_20251123_191451",
-}
+# Load dataset mappings from config
+def load_adapter_config():
+    """Load adapter datasets from config/loras.json."""
+    config_path = Path(__file__).parent.parent / "config" / "loras.json"
+    with open(config_path) as f:
+        config = json.load(f)
 
+    adapter_datasets = {}
+    for name, info in config["loras"].items():
+        if "dataset" in info:
+            adapter_datasets[name] = info["dataset"]
+
+    return adapter_datasets
+
+
+# Labels for all adapters (including chandra for OCR)
 ADAPTER_LABELS = {
     "calendar": 0,
     "claim-window": 1,
     "provider-select": 2,
+    "chandra": 3,
 }
+
+# OCR prompt templates for Chandra routing
+OCR_PROMPT_TEMPLATES = [
+    "Read the text in this image and return it using an ocr tool_call",
+    "Read the text from this cropped screenshot",
+    "Read all visible text in this image",
+    "Read and extract the text content from this image",
+    "Read what's written in this image and return it via ocr tool_call",
+    "Please read the text in this image and return it",
+    "I need you to read the text from this screenshot",
+    "Can you read the text shown in this image?",
+    "Look at this image and read the text content",
+    "Here is a screenshot - read the text and return it",
+    "This is a cropped region - read the text from it",
+    "Here is a screenshot that has been cropped to just the region we want. Read the text from the image and return it using an ocr tool_call",
+    "This image contains text that needs to be read",
+    "Extract the text from this image - read it carefully",
+    "I've cropped this screenshot to the area you need to read",
+    "Extract the text from this image",
+    "Extract all text content from this screenshot",
+    "Please extract the text shown in this cropped image",
+    "I need the text extracted from this image",
+    "Perform OCR on this image and return the text",
+    "Run OCR on this cropped screenshot",
+    "Use OCR to get the text from this image",
+    "OCR this image and return the result",
+    "Apply OCR to extract the text content",
+    "Transcribe the text in this image",
+    "Transcribe what you see in this screenshot",
+    "Please transcribe the text content from this image",
+    "Get the text from this image",
+    "Get all text content visible in this screenshot",
+    "Return the text shown in this image",
+    "Return the text content from this cropped region",
+    "Read the procedure codes from this image",
+    "Extract the patient information shown in this screenshot",
+    "Read the text from this claim form section",
+    "Extract the provider details from this cropped image",
+    "Read the appointment details shown here",
+    "Get the insurance information from this image",
+    "Extract the diagnosis codes visible in this screenshot",
+]
+
+
+def generate_ocr_samples(rng, count: int, system_prompt: str) -> list[dict]:
+    """Generate OCR routing samples for Chandra."""
+    templates = list(OCR_PROMPT_TEMPLATES)
+    rng.shuffle(templates)
+
+    samples = []
+    for i in range(count):
+        prompt = templates[i % len(templates)]
+        sample = {
+            "id": f"ocr_{i:04d}",
+            "image": "",  # OCR uses cropped images provided at inference
+            "conversations": [
+                {"from": "system", "value": system_prompt},
+                {"from": "human", "value": f"<image>\n{prompt}"},
+                {"from": "gpt", "value": "chandra"},
+            ],
+            "metadata": {
+                "adapter": "chandra",
+                "label": ADAPTER_LABELS["chandra"],
+            },
+        }
+        samples.append(sample)
+
+    return samples
 
 
 @app.function(
@@ -52,13 +130,17 @@ def generate_routing_dataset(
     eval_tasks: int = 100,
     seed: int = 42,
 ):
-    """Generate balanced routing dataset from 3 adapter sources.
+    """Generate balanced routing dataset from adapter sources + OCR.
 
     Creates three separate splits:
     - train.jsonl: Training data (train_tasks total, balanced across adapters)
     - val.jsonl: Validation data used during training for early stopping (val_tasks total)
     - eval.jsonl: Held-out evaluation data for final accuracy testing (eval_tasks total)
     """
+
+    # Load adapter config
+    adapter_datasets = load_adapter_config()
+    num_adapters = len(adapter_datasets) + 1  # +1 for chandra
 
     rng = random.Random(seed)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -67,15 +149,16 @@ def generate_routing_dataset(
     images_dir = output_dir / "images"
     images_dir.mkdir(exist_ok=True)
 
-    # Per-adapter targets (divide by 3 adapters)
-    train_per_adapter = train_tasks // 3
-    val_per_adapter = val_tasks // 3
-    eval_per_adapter = eval_tasks // 3
+    # Per-adapter targets (divide by num_adapters)
+    train_per_adapter = train_tasks // num_adapters
+    val_per_adapter = val_tasks // num_adapters
+    eval_per_adapter = eval_tasks // num_adapters
 
     print(f"\n{'='*70}")
     print(f"Generating BALANCED Routing Dataset")
     print(f"{'='*70}")
     print(f"Output: {output_dir}")
+    print(f"Adapters: {list(adapter_datasets.keys())} + chandra")
     print(f"Train: {train_tasks} total ({train_per_adapter} per adapter)")
     print(f"Val: {val_tasks} total ({val_per_adapter} per adapter) - for training early stopping")
     print(f"Eval: {eval_tasks} total ({eval_per_adapter} per adapter) - held-out for final accuracy")
@@ -85,7 +168,10 @@ def generate_routing_dataset(
     all_val_samples = []
     all_eval_samples = []
 
-    for adapter_name, dataset_name in ADAPTER_DATASETS.items():
+    # Get system prompt from first dataset for OCR samples
+    system_prompt = ""
+
+    for adapter_name, dataset_name in adapter_datasets.items():
         label = ADAPTER_LABELS[adapter_name]
         dataset_path = Path(f"/training-data/{dataset_name}/train.jsonl")
         source_images_dir = Path(f"/training-data/{dataset_name}/images")
@@ -184,6 +270,13 @@ def generate_routing_dataset(
 
         print(f"  {adapter_name:20s} -> train={len(train_samples):4d}, val={len(val_samples):4d}, eval={len(eval_samples):4d}")
 
+        # Capture system prompt from first sample for OCR generation
+        if not system_prompt and train_samples:
+            for conv in train_samples[0].get("conversations", []):
+                if conv["from"] == "system":
+                    system_prompt = conv["value"]
+                    break
+
         # Copy images
         images_copied = set()
         for sample in train_samples + val_samples + eval_samples:
@@ -203,6 +296,18 @@ def generate_routing_dataset(
                         shutil.copy2(src, dst)
                     images_copied.add(img_name)
                 sample["image"] = f"images/{img_name}"
+
+    # Generate OCR samples for Chandra
+    print(f"\nGenerating OCR samples for chandra...")
+    ocr_train = generate_ocr_samples(rng, train_per_adapter, system_prompt)
+    ocr_val = generate_ocr_samples(rng, val_per_adapter, system_prompt)
+    ocr_eval = generate_ocr_samples(rng, eval_per_adapter, system_prompt)
+
+    all_train_samples.extend(ocr_train)
+    all_val_samples.extend(ocr_val)
+    all_eval_samples.extend(ocr_eval)
+
+    print(f"  {'chandra':20s} -> train={len(ocr_train):4d}, val={len(ocr_val):4d}, eval={len(ocr_eval):4d}")
 
     # Shuffle all splits
     rng.shuffle(all_train_samples)
@@ -237,11 +342,14 @@ def generate_routing_dataset(
     save_jsonl(output_dir / "eval.jsonl", all_eval_samples)
 
     # Metadata
+    adapters_meta = {name: {"label": ADAPTER_LABELS[name], "source": ds} for name, ds in adapter_datasets.items()}
+    adapters_meta["chandra"] = {"label": ADAPTER_LABELS["chandra"], "source": "generated"}
+
     metadata = {
         "dataset_name": "routing",
         "created_at": datetime.now().isoformat(),
         "seed": seed,
-        "adapters": {name: {"label": ADAPTER_LABELS[name], "source": ds} for name, ds in ADAPTER_DATASETS.items()},
+        "adapters": adapters_meta,
         "samples": {"train": len(all_train_samples), "val": len(all_val_samples), "eval": len(all_eval_samples)},
         "label_distribution_train": dist,
     }
