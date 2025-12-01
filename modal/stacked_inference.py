@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Stacked inference: Routing LoRA → Task LoRA.
+"""Stacked inference: Routing LoRA → Task LoRA or Chandra.
 
-Uses the trained routing LoRA to classify which adapter to use,
-then loads the task-specific LoRA for actual inference.
+Uses the trained routing LoRA to classify which adapter/model to use:
+- calendar, claim-window, provider-select → Qwen + task LoRA
+- chandra → Chandra OCR model → Qwen formats result as tool_call
 
 Usage:
     modal run modal/stacked_inference.py --test
@@ -38,7 +39,11 @@ image = (
     )
 )
 
-VALID_ADAPTERS = {"calendar", "claim-window", "provider-select"}
+VALID_LORA_ADAPTERS = {"calendar", "claim-window", "provider-select"}
+VALID_ADAPTERS = VALID_LORA_ADAPTERS | {"chandra"}
+
+# Chandra OCR model
+CHANDRA_MODEL = "datalab-to/Chandra-VLM-4B-Instruct"
 
 # Routing LoRA checkpoint
 DEFAULT_ROUTING_CHECKPOINT = "checkpoints/datasets/routing_20251125_065129/routing-20251125-065129/final"
@@ -65,6 +70,86 @@ def get_task_lora_path(adapter: str) -> str:
 
     # Otherwise use base path (direct upload)
     return base_path
+
+
+def format_ocr_tool_call(text: str) -> str:
+    """Format OCR text as a tool_call response.
+
+    Args:
+        text: Raw text extracted by Chandra
+
+    Returns:
+        Formatted tool_call string for the ocr action
+    """
+    tool_call = {
+        "name": "computer_use",
+        "arguments": {
+            "action": "ocr",
+            "text": text,
+        },
+    }
+    return f"Action: Return the extracted text.\n<tool_call>\n{json.dumps(tool_call)}\n</tool_call>"
+
+
+def run_chandra_ocr(image_path: str, device: str = "cuda") -> str:
+    """Run Chandra OCR model on an image.
+
+    Args:
+        image_path: Path to the image file
+        device: Device to run on
+
+    Returns:
+        Extracted text from the image
+    """
+    import torch
+    from transformers import AutoProcessor, AutoModelForVision2Seq
+    from PIL import Image
+
+    print(f"Loading Chandra model: {CHANDRA_MODEL}")
+    processor = AutoProcessor.from_pretrained(CHANDRA_MODEL, trust_remote_code=True)
+    model = AutoModelForVision2Seq.from_pretrained(
+        CHANDRA_MODEL,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
+
+    # Load and process image
+    image = Image.open(image_path).convert("RGB")
+
+    # Chandra prompt for OCR
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": "Read and extract all text from this image."},
+            ],
+        }
+    ]
+
+    # Process inputs
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=text, images=[image], return_tensors="pt", padding=True)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    # Generate
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=1024,
+            do_sample=False,
+        )
+
+    input_len = inputs["input_ids"].shape[1]
+    extracted_text = processor.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+
+    # Cleanup
+    del model
+    torch.cuda.empty_cache()
+
+    return extracted_text
 
 
 @app.function(
@@ -190,63 +275,76 @@ def stacked_inference(
         result["error"] = f"Invalid adapter: {routed_adapter}"
         return result
 
-    # === STEP 2: Run task LoRA ===
-    task_lora_path = get_task_lora_path(routed_adapter)
-    print(f"\nStep 2: Loading task LoRA from {task_lora_path}...")
-
     # Unload routing LoRA
     del router_model
     torch.cuda.empty_cache()
 
-    # Load task LoRA
-    task_model = PeftModel.from_pretrained(base_model, task_lora_path)
-    task_model.eval()
+    # === STEP 2: Run task model ===
+    if routed_adapter == "chandra":
+        # === OCR path: Chandra → format as tool_call ===
+        print(f"\nStep 2: Running Chandra OCR on {image_path}...")
 
-    # Build task messages (use original system prompt + user message, no routing modification)
-    task_messages = []
-    for conv in sample["conversations"]:
-        if conv["from"] == "system":
-            task_messages.append({"role": "system", "content": conv["value"]})
-        elif conv["from"] == "human":
-            content = []
-            value = conv["value"]
+        # Run Chandra to extract text
+        extracted_text = run_chandra_ocr(str(image_path), device=str(device))
+        print(f"Chandra extracted: {extracted_text[:100]}...")
 
-            if "<image>" in value:
-                img_name = Path(sample["image"]).name
-                image_path = dataset_dir / "images" / img_name
-                if image_path.exists():
-                    content.append({"type": "image", "image": f"file://{image_path}"})
-                value = value.replace("<image>", "").strip()
+        # Format as tool_call
+        task_output = format_ocr_tool_call(extracted_text)
 
-            if value:
-                content.append({"type": "text", "text": value})
+    else:
+        # === LoRA path: Load task-specific LoRA ===
+        task_lora_path = get_task_lora_path(routed_adapter)
+        print(f"\nStep 2: Loading task LoRA from {task_lora_path}...")
 
-            task_messages.append({"role": "user", "content": content})
+        # Load task LoRA
+        task_model = PeftModel.from_pretrained(base_model, task_lora_path)
+        task_model.eval()
 
-    # Generate task output
-    text = processor.apply_chat_template(task_messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs = process_vision_info(task_messages)
+        # Build task messages (use original system prompt + user message, no routing modification)
+        task_messages = []
+        for conv in sample["conversations"]:
+            if conv["from"] == "system":
+                task_messages.append({"role": "system", "content": conv["value"]})
+            elif conv["from"] == "human":
+                content = []
+                value = conv["value"]
 
-    inputs = processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        return_tensors="pt",
-        padding=True,
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+                if "<image>" in value:
+                    img_name = Path(sample["image"]).name
+                    image_path = dataset_dir / "images" / img_name
+                    if image_path.exists():
+                        content.append({"type": "image", "image": f"file://{image_path}"})
+                    value = value.replace("<image>", "").strip()
 
-    print("Running task inference...")
-    with torch.no_grad():
-        outputs = task_model.generate(
-            **inputs,
-            max_new_tokens=512,
-            do_sample=False,
-            pad_token_id=processor.tokenizer.pad_token_id,
+                if value:
+                    content.append({"type": "text", "text": value})
+
+                task_messages.append({"role": "user", "content": content})
+
+        # Generate task output
+        text = processor.apply_chat_template(task_messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(task_messages)
+
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            return_tensors="pt",
+            padding=True,
         )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    input_len = inputs["input_ids"].shape[1]
-    task_output = processor.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+        print("Running task inference...")
+        with torch.no_grad():
+            outputs = task_model.generate(
+                **inputs,
+                max_new_tokens=512,
+                do_sample=False,
+                pad_token_id=processor.tokenizer.pad_token_id,
+            )
+
+        input_len = inputs["input_ids"].shape[1]
+        task_output = processor.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
 
     result["task_output"] = task_output
 
