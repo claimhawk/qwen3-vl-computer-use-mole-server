@@ -3,17 +3,37 @@
     "calendar": {
       "volume": "moe-lora-checkpoints",
       "path": "calendar-tasks",
-      "dataset": "mike-im-day-clicks-system-prompt-8B_20251120_180854"
+      "dataset": "calendar-mike-20251202_113010"
     },
     "claim-window": {
       "volume": "moe-lora-checkpoints",
       "path": "claim-window",
-      "dataset": "claim-window_20251123_221931"
+      "dataset": "provider-select-mike-20251202_111231"
     },
     "provider-select": {
       "volume": "moe-lora-checkpoints",
       "path": "provider-select",
-      "dataset": "select-provider-dropdown_20251123_191451"
+      "dataset": "provider-select-mike-20251202_111231"
+    },
+    "appointment": {
+      "volume": "moe-lora-checkpoints",
+      "path": "appointment",
+      "dataset": "appointment_20251202_111820"
+    },
+    "login-window": {
+      "volume": "moe-lora-checkpoints",
+      "path": "login-window",
+      "dataset": "login-window-michaeloneal-20251202_113305"
+    },
+    "desktop": {
+      "volume": "moe-lora-checkpoints",
+      "path": "desktop",
+      "dataset": "desktop-mike-20251201_214626"
+    },
+    "chart-screen": {
+      "volume": "moe-lora-checkpoints",
+      "path": "chart-screen",
+      "dataset": "chart-screen-mike-20251202_115044"
     }
   }
 }

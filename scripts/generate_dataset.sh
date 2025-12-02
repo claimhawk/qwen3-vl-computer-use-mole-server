@@ -38,6 +38,9 @@ if [[ "$DRY_RUN" == "true" ]]; then
   exit 0
 fi
 
+# Set env var so Modal scripts know they were called from shell script
+export FROM_SCRIPT=1
+
 # Execute dataset generation on Modal (downloads locally too)
 OUTPUT=$(uvx modal run modal/generate_routing.py --train-tasks "$TRAIN_TASKS" --val-tasks "$VAL_TASKS" --eval-tasks "$EVAL_TASKS" 2>&1 | tee /dev/stderr)
 

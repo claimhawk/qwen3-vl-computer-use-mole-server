@@ -9,34 +9,73 @@ Usage:
 """
 
 import json
+import os
 import random
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import modal
 
+
+def check_script_invocation() -> None:
+    """Check if script was invoked from shell script, print warning if not.
+
+    Scripts should be run via ./scripts/generate_dataset.sh to ensure the full
+    pipeline (generate + preprocess + train) is executed. Running modal/xxx.py
+    directly will skip the subsequent stages.
+
+    The shell script should set FROM_SCRIPT=1 before calling the modal script.
+    """
+    if os.environ.get("FROM_SCRIPT") != "1":
+        print("")
+        print("*" * 60)
+        print("*" + " " * 58 + "*")
+        print("*" + "  WARNING: Running modal script directly!".center(56) + "  *")
+        print("*" + " " * 58 + "*")
+        print("*" + "  Use ./scripts/generate_dataset.sh for the full pipeline:".center(56) + "  *")
+        print("*" + "  - Dataset generation".center(56) + "  *")
+        print("*" + "  - Preprocessing".center(56) + "  *")
+        print("*" + "  - Training".center(56) + "  *")
+        print("*" + " " * 58 + "*")
+        print("*" + "  Run: ./scripts/generate_dataset.sh".center(56) + "  *")
+        print("*" + "  Or:  ./scripts/generate_dataset.sh --dry  (no training)".center(56) + "  *")
+        print("*" + " " * 58 + "*")
+        print("*" * 60)
+        print("")
+        sys.stderr.flush()
+        sys.stdout.flush()
+
 app = modal.App("routing-dataset-generator")
 
 # Volumes
-training_data_volume = modal.Volume.from_name("claimhawk-training-data", create_if_missing=False)
+training_data_volume = modal.Volume.from_name("claimhawk-lora-training", create_if_missing=False)
 moe_volume = modal.Volume.from_name("moe-lora-data", create_if_missing=True)
 
 image = modal.Image.debian_slim(python_version="3.12")
 
-# Load dataset mappings from config
-def load_adapter_config():
-    """Load adapter datasets from config/loras.json."""
-    config_path = Path(__file__).parent.parent / "config" / "loras.json"
-    with open(config_path) as f:
-        config = json.load(f)
 
-    adapter_datasets = {}
-    for name, info in config["loras"].items():
-        if "dataset" in info:
-            adapter_datasets[name] = info["dataset"]
-
-    return adapter_datasets
+# Dataset mappings - loaded from config/loras.json locally, with fallback for Modal
+ADAPTER_DATASETS = {
+    "calendar": "calendar-mike-20251202_113010",
+    "claim-window": "provider-select-mike-20251202_111231",
+    "provider-select": "provider-select-mike-20251202_111231",
+    "appointment": "appointment_20251202_111820",
+    "login-window": "login-window-michaeloneal-20251202_113305",
+    "desktop": "desktop-mike-20251201_214626",
+    "chart-screen": "chart-screen-mike-20251202_115044",
+}
+# Try to load from config (works locally, fails silently on Modal)
+try:
+    import os as _os
+    _config_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "config", "loras.json")
+    with open(_config_path) as _f:
+        _config = json.load(_f)
+    ADAPTER_DATASETS = {name: info["dataset"] for name, info in _config["loras"].items() if "dataset" in info}
+    del _os, _config_path, _f, _config
+except FileNotFoundError:
+    pass  # Use hardcoded fallback above
 
 
 # Labels for all adapters (including chandra for OCR)
@@ -45,6 +84,10 @@ ADAPTER_LABELS = {
     "claim-window": 1,
     "provider-select": 2,
     "chandra": 3,
+    "desktop": 4,
+    "appointment": 5,
+    "login-window": 6,
+    "chart-screen": 7,
 }
 
 # OCR prompt templates for Chandra routing
@@ -138,8 +181,8 @@ def generate_routing_dataset(
     - eval.jsonl: Held-out evaluation data for final accuracy testing (eval_tasks total)
     """
 
-    # Load adapter config
-    adapter_datasets = load_adapter_config()
+    # Use pre-loaded adapter config
+    adapter_datasets = ADAPTER_DATASETS
     num_adapters = len(adapter_datasets) + 1  # +1 for chandra
 
     rng = random.Random(seed)
@@ -173,8 +216,8 @@ def generate_routing_dataset(
 
     for adapter_name, dataset_name in adapter_datasets.items():
         label = ADAPTER_LABELS[adapter_name]
-        dataset_path = Path(f"/training-data/{dataset_name}/train.jsonl")
-        source_images_dir = Path(f"/training-data/{dataset_name}/images")
+        dataset_path = Path(f"/training-data/datasets/{dataset_name}/train.jsonl")
+        source_images_dir = Path(f"/training-data/datasets/{dataset_name}/images")
 
         print(f"Loading {adapter_name} from {dataset_name}...")
 
@@ -289,7 +332,7 @@ def generate_routing_dataset(
 
                 src = source_images_dir / img_name
                 if not src.exists():
-                    src = Path(f"/training-data/{dataset_name}") / img_path
+                    src = Path(f"/training-data/datasets/{dataset_name}") / img_path
                 if src.exists():
                     dst = images_dir / img_name
                     if not dst.exists():
@@ -375,6 +418,9 @@ def main(
 ):
     import subprocess
     from pathlib import Path
+
+    # Check if invoked from shell script - warn if not
+    check_script_invocation()
 
     dataset_name = generate_routing_dataset.remote(
         train_tasks=train_tasks,
