@@ -18,6 +18,32 @@ from pathlib import Path
 
 import modal
 
+# =============================================================================
+# CENTRALIZED CONFIGURATION
+# =============================================================================
+# Volume names and adapter info are loaded from config/adapters.yaml via the SDK.
+# Users can customize these by editing the YAML file.
+
+try:
+    from sdk.modal_compat import get_volume_name, get_adapter_labels
+    LORA_VOLUME_NAME = get_volume_name("lora_training")
+    MOE_VOLUME_NAME = get_volume_name("moe_data")
+    ADAPTER_LABELS = get_adapter_labels()
+except ImportError:
+    # Fallback for Modal remote execution
+    LORA_VOLUME_NAME = "claimhawk-lora-training"
+    MOE_VOLUME_NAME = "moe-lora-data"
+    ADAPTER_LABELS = {
+        "calendar": 0,
+        "claim-window": 1,
+        "provider-select": 2,
+        "chandra": 3,
+        "desktop": 4,
+        "appointment": 5,
+        "login-window": 6,
+        "chart-screen": 7,
+    }
+
 
 def check_script_invocation() -> None:
     """Check if script was invoked from shell script, print warning if not.
@@ -49,9 +75,9 @@ def check_script_invocation() -> None:
 
 app = modal.App("routing-dataset-generator")
 
-# Volumes
-training_data_volume = modal.Volume.from_name("claimhawk-lora-training", create_if_missing=False)
-moe_volume = modal.Volume.from_name("moe-lora-data", create_if_missing=True)
+# Volumes (using centralized config)
+training_data_volume = modal.Volume.from_name(LORA_VOLUME_NAME, create_if_missing=False)
+moe_volume = modal.Volume.from_name(MOE_VOLUME_NAME, create_if_missing=True)
 
 image = modal.Image.debian_slim(python_version="3.12")
 
@@ -59,8 +85,8 @@ image = modal.Image.debian_slim(python_version="3.12")
 # Dataset mappings - loaded from config/loras.json locally, with fallback for Modal
 ADAPTER_DATASETS = {
     "calendar": "calendar-mike-20251202_113010",
-    "claim-window": "provider-select-mike-20251202_111231",
-    "provider-select": "provider-select-mike-20251202_111231",
+    "claim-window": "procedure-scroll-mike-20251202_142525",
+    "provider-select": "provider-select-mike-20251202_144036",
     "appointment": "appointment_20251202_111820",
     "login-window": "login-window-michaeloneal-20251202_113305",
     "desktop": "desktop-mike-20251201_214626",
@@ -77,18 +103,6 @@ try:
 except FileNotFoundError:
     pass  # Use hardcoded fallback above
 
-
-# Labels for all adapters (including chandra for OCR)
-ADAPTER_LABELS = {
-    "calendar": 0,
-    "claim-window": 1,
-    "provider-select": 2,
-    "chandra": 3,
-    "desktop": 4,
-    "appointment": 5,
-    "login-window": 6,
-    "chart-screen": 7,
-}
 
 # OCR prompt templates for Chandra routing
 OCR_PROMPT_TEMPLATES = [
@@ -133,19 +147,33 @@ OCR_PROMPT_TEMPLATES = [
 ]
 
 
-def generate_ocr_samples(rng, count: int, system_prompt: str) -> list[dict]:
-    """Generate OCR routing samples for Chandra."""
+def generate_ocr_samples(rng, count: int, images_dir: Path, ocr_source_dir: Path) -> list[dict]:
+    """Generate OCR routing samples for Chandra using actual OCR images."""
     templates = list(OCR_PROMPT_TEMPLATES)
     rng.shuffle(templates)
+
+    # Get list of OCR images
+    ocr_images = sorted(ocr_source_dir.glob("*.png")) if ocr_source_dir.exists() else []
+    if not ocr_images:
+        print(f"  WARNING: No OCR images found in {ocr_source_dir}")
+        return []
+
+    # Copy OCR images to output images dir
+    for img in ocr_images:
+        dst = images_dir / f"ocr_{img.name}"
+        if not dst.exists():
+            shutil.copy2(img, dst)
 
     samples = []
     for i in range(count):
         prompt = templates[i % len(templates)]
+        # Cycle through available OCR images
+        img = ocr_images[i % len(ocr_images)]
         sample = {
             "id": f"ocr_{i:04d}",
-            "image": "",  # OCR uses cropped images provided at inference
+            "image": f"images/ocr_{img.name}",
             "conversations": [
-                {"from": "system", "value": system_prompt},
+                # No system prompt - preprocessor will add it
                 {"from": "human", "value": f"<image>\n{prompt}"},
                 {"from": "gpt", "value": "chandra"},
             ],
@@ -211,9 +239,6 @@ def generate_routing_dataset(
     all_val_samples = []
     all_eval_samples = []
 
-    # Get system prompt from first dataset for OCR samples
-    system_prompt = ""
-
     for adapter_name, dataset_name in adapter_datasets.items():
         label = ADAPTER_LABELS[adapter_name]
         dataset_path = Path(f"/training-data/datasets/{dataset_name}/train.jsonl")
@@ -256,14 +281,23 @@ def generate_routing_dataset(
                 },
             }
 
-            # Filter conversations: keep system and human, replace gpt with adapter name
+            # Filter conversations: keep only human, replace gpt with adapter name
+            # Do NOT include system prompt - preprocessor will add it
             if "conversations" in task:
                 new_convs = []
                 for conv in task["conversations"]:
                     if conv["from"] == "system":
-                        new_convs.append(conv)
+                        # Skip system prompt - preprocessor adds it
+                        continue
                     elif conv["from"] == "human":
-                        new_convs.append(conv)
+                        value = conv["value"]
+                        # Fix desktop prompts: desktop icons require double-click, not left click
+                        if adapter_name == "desktop":
+                            value = value.replace("Left click", "Double click")
+                            value = value.replace("left click", "double click")
+                            value = value.replace("Click on", "Double click on")
+                            value = value.replace("click on", "double click on")
+                        new_convs.append({"from": "human", "value": value})
                     elif conv["from"] == "gpt":
                         # Replace with adapter name as the response
                         new_convs.append({"from": "gpt", "value": adapter_name})
@@ -313,13 +347,6 @@ def generate_routing_dataset(
 
         print(f"  {adapter_name:20s} -> train={len(train_samples):4d}, val={len(val_samples):4d}, eval={len(eval_samples):4d}")
 
-        # Capture system prompt from first sample for OCR generation
-        if not system_prompt and train_samples:
-            for conv in train_samples[0].get("conversations", []):
-                if conv["from"] == "system":
-                    system_prompt = conv["value"]
-                    break
-
         # Copy images
         images_copied = set()
         for sample in train_samples + val_samples + eval_samples:
@@ -342,9 +369,10 @@ def generate_routing_dataset(
 
     # Generate OCR samples for Chandra
     print(f"\nGenerating OCR samples for chandra...")
-    ocr_train = generate_ocr_samples(rng, train_per_adapter, system_prompt)
-    ocr_val = generate_ocr_samples(rng, val_per_adapter, system_prompt)
-    ocr_eval = generate_ocr_samples(rng, eval_per_adapter, system_prompt)
+    ocr_source_dir = Path("/moe-data/ocr-images/ocr")
+    ocr_train = generate_ocr_samples(rng, train_per_adapter, images_dir, ocr_source_dir)
+    ocr_val = generate_ocr_samples(rng, val_per_adapter, images_dir, ocr_source_dir)
+    ocr_eval = generate_ocr_samples(rng, eval_per_adapter, images_dir, ocr_source_dir)
 
     all_train_samples.extend(ocr_train)
     all_val_samples.extend(ocr_val)

@@ -21,11 +21,48 @@ from typing import Any
 
 import modal
 
+# =============================================================================
+# CENTRALIZED CONFIGURATION
+# =============================================================================
+# Volume names and adapter info are loaded from config/adapters.yaml via the SDK.
+# Users can customize these by editing the YAML file.
+
+try:
+    from sdk.modal_compat import get_volume_name, get_valid_experts, get_base_vlm
+    MOE_VOLUME_NAME = get_volume_name("moe_data")
+    TRAINING_DATA_VOLUME_NAME = get_volume_name("training_data")
+    BASE_MODEL = get_base_vlm()
+    _adapter_names = "\n".join(f"- {name}" for name in sorted(get_valid_experts()))
+    SYSTEM_PROMPT = f"""You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
+
+Valid adapters names:
+{_adapter_names}
+
+What adapter name should handle this image and instruction?"""
+except ImportError:
+    # Fallback for Modal remote execution
+    MOE_VOLUME_NAME = "moe-lora-data"
+    TRAINING_DATA_VOLUME_NAME = "claimhawk-training-data"
+    BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
+    SYSTEM_PROMPT = """You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
+
+Valid adapters names:
+- appointment
+- calendar
+- chart-screen
+- chandra
+- claim-window
+- desktop
+- login-window
+- provider-select
+
+What adapter name should handle this image and instruction?"""
+
 # Modal App Setup
 app = modal.App("moe-lora-preprocessing")
 
-# Volume - defined at module level so we can reload it
-VOLUME = modal.Volume.from_name("moe-lora-data", create_if_missing=True)
+# Volume - defined at module level so we can reload it (using centralized config)
+VOLUME = modal.Volume.from_name(MOE_VOLUME_NAME, create_if_missing=True)
 
 # Docker Image with Dependencies (CPU-only, no GPU needed)
 image = (
@@ -245,6 +282,10 @@ def preprocess_dataset_impl(dataset_name: str):
 
     print("\nProcessing unique images...")
     for img_path in tqdm(sorted(unique_images), desc="Caching images"):
+        # Skip empty image paths (e.g., OCR samples without images)
+        if not img_path or img_path == "":
+            continue
+
         # Image paths in JSONL might be like "calendar_20251114_224610/images/screen_2024_01.png"
         # But dataset_base_path is "/training_data/calendar_20251114_224610/calendar_20251114_224610"
         # So we need to strip the first component if it matches the base dataset name
@@ -306,14 +347,20 @@ def preprocess_dataset_impl(dataset_name: str):
         old_conversations = sample["conversations"]
 
         # Convert to Qwen-VL's expected format (but only for text, image is cached)
-        # NOTE: System prompt should already be in the dataset - we just pass it through
         messages = []
 
+        # Always inject system prompt
+        messages.append({
+            "role": "system",
+            "content": [{"type": "text", "text": SYSTEM_PROMPT}]
+        })
+
         for msg in old_conversations:
-            # Map dataset roles to model roles
+            # Skip all system messages - we already injected our own
             if msg["from"] == "system":
-                role = "system"
-            elif msg["from"] == "human":
+                continue
+            # Map dataset roles to model roles
+            if msg["from"] == "human":
                 role = "user"
             else:  # "gpt" or "assistant"
                 role = "assistant"
@@ -505,7 +552,7 @@ def preprocess_dataset_impl(dataset_name: str):
     print(f"\n{'='*80}")
     print("🎉 PREPROCESSING COMPLETE!")
     print(f"{'='*80}\n")
-    print(f"Preprocessed data is now available in the 'claimhawk-training-data' volume")
+    print(f"Preprocessed data is now available in the '{TRAINING_DATA_VOLUME_NAME}' volume")
     print(f"\nNext step:")
     print(f"  modal run modal/training.py --run-name my_training_run")
 
@@ -770,8 +817,8 @@ def main(dataset_name: str = "claimhawk-training-data", parallel: bool = False, 
 
         # Create coordinator app to load data and dispatch batches
         coordinator_app = modal.App(f"moe-lora-preprocessing-coordinator-{dataset_name}")
-        training_data_volume = modal.Volume.from_name("claimhawk-training-data")
-        preprocessed_data_volume = modal.Volume.from_name("claimhawk-training-data", create_if_missing=True)
+        training_data_volume = modal.Volume.from_name(TRAINING_DATA_VOLUME_NAME)
+        preprocessed_data_volume = modal.Volume.from_name(TRAINING_DATA_VOLUME_NAME, create_if_missing=True)
 
         @coordinator_app.function(
             image=image,

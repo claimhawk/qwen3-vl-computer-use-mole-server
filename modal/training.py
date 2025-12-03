@@ -1,3 +1,4 @@
+# Version: 2025-12-02-v8 - Eval injects system prompt to match preprocessing
 """
 Qwen3-VL LoRA Fine-tuning on Modal
 
@@ -22,14 +23,53 @@ from typing import Any
 
 import modal
 
-# Base model configuration (from config.py)
-BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
+# =============================================================================
+# CENTRALIZED CONFIGURATION
+# =============================================================================
+# Volume names, model names, and adapter info are loaded from config/adapters.yaml.
+# Users can customize these by editing the YAML file.
+# Fallbacks are provided for Modal remote execution where SDK may not be available.
+
+try:
+    from sdk.modal_compat import (
+        get_volume_name,
+        get_base_vlm,
+        get_router_system_prompt,
+        get_valid_experts,
+    )
+    MOE_VOLUME_NAME = get_volume_name("moe_data")
+    BASE_MODEL = get_base_vlm()
+    # Build eval system prompt dynamically from registry
+    _valid_adapters = "\n".join(f"- {name}" for name in sorted(get_valid_experts()))
+    EVAL_SYSTEM_PROMPT = f"""You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
+
+Valid adapters names:
+{_valid_adapters}
+
+What adapter name should handle this image and instruction?"""
+except ImportError:
+    # Fallback for Modal remote execution
+    MOE_VOLUME_NAME = "moe-lora-data"
+    BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
+    EVAL_SYSTEM_PROMPT = """You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
+
+Valid adapters names:
+- calendar
+- claim-window
+- provider-select
+- chandra
+- appointment
+- login-window
+- desktop
+- chart-screen
+
+What adapter name should handle this image and instruction?"""
 
 # Modal App Setup
 app = modal.App("moe-lora-training")
 
 # Modal Volumes - ONE volume with folders for each thing
-moe_volume = modal.Volume.from_name("moe-lora-data", create_if_missing=True)
+moe_volume = modal.Volume.from_name(MOE_VOLUME_NAME, create_if_missing=True)
 checkpoints_volume = moe_volume
 logs_volume = moe_volume
 data_volume = moe_volume
@@ -461,17 +501,20 @@ def train_qwen3vl_lora(
         if learning_rate is None: learning_rate = 3e-5
         if patience is None: patience = 8
 
-    # Apply fast mode scaling (after auto-tuning or defaults)
+    # Fast mode: 40 steps, then exit (quick training run for validation)
+    max_steps_override = None
     if fast:
         print(f"\n{'='*80}")
-        print("⚡ Fast Mode Adjustments")
+        print("⚡ FAST MODE")
         print(f"{'='*80}\n")
-        original_lr = learning_rate
-        original_patience = patience
-        learning_rate = learning_rate * 2.0  # Double LR for faster convergence
-        patience = max(2, int(patience * 0.5))  # Halve patience (min 2)
-        print(f"🔧 Learning rate: {original_lr:.2e} → {learning_rate:.2e} (2x)")
-        print(f"🔧 Patience: {original_patience} → {patience} (0.5x, min 2)\n")
+        max_steps_override = 40
+        eval_steps = 40  # Evaluate at end
+        save_steps = 40  # Save checkpoint at end
+        print(f"🔧 max_steps: {max_steps_override}")
+        print(f"🔧 eval_steps: {eval_steps}")
+        print(f"🔧 save_steps: {save_steps}")
+        print(f"🔧 Early stopping: DISABLED (will exit after {max_steps_override} steps)")
+        print(f"\nPipeline: load dataset → load model → train {max_steps_override} steps → validate → checkpoint → stats → exit\n")
 
     # Loss weighting for tool_call tokens (used for computer use training)
     # For routing training (simple classification), use equal weights
@@ -870,8 +913,8 @@ def train_qwen3vl_lora(
     # Training arguments (matches UI-TARS config)
     training_args = TrainingArguments(
         output_dir=output_dir,
-        max_steps=-1,  # No step limit (use epochs instead)
-        num_train_epochs=num_epochs,
+        max_steps=max_steps_override if max_steps_override else -1,
+        num_train_epochs=num_epochs if not max_steps_override else -1,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -1093,10 +1136,10 @@ def train_qwen3vl_lora(
     class VolumeCommitCallback(TrainerCallback):
         """Commits Modal volumes after each checkpoint save"""
         def __init__(self):
-            # Reference the same Modal volumes by name
-            self.checkpoint_volume = modal.Volume.from_name("moe-lora-data")
-            self.logs_volume = modal.Volume.from_name("moe-lora-data")
-            self.data_volume = modal.Volume.from_name("moe-lora-data")
+            # Reference the same Modal volumes by name (uses centralized config)
+            self.checkpoint_volume = modal.Volume.from_name(MOE_VOLUME_NAME)
+            self.logs_volume = modal.Volume.from_name(MOE_VOLUME_NAME)
+            self.data_volume = modal.Volume.from_name(MOE_VOLUME_NAME)
 
         def on_save(self, args, state, control, **kwargs):
             # Commit volumes after each checkpoint save
@@ -1560,7 +1603,12 @@ def train_qwen3vl_lora(
     print(f"{'='*80}\n")
 
     eval_result = None
-    VALID_ADAPTERS = {"calendar", "claim-window", "provider-select"}
+    # Valid adapters - loaded from centralized config/adapters.yaml
+    try:
+        from sdk.adapters import AdapterRegistry
+        VALID_ADAPTERS = AdapterRegistry().valid_set()
+    except ImportError:
+        VALID_ADAPTERS = {"calendar", "claim-window", "provider-select", "chandra", "appointment", "login-window", "desktop", "chart-screen"}
 
     try:
         from qwen_vl_utils import process_vision_info
@@ -1599,11 +1647,13 @@ def train_qwen3vl_lora(
             for sample in tqdm(eval_data, desc="Evaluating"):
                 expected_adapter = sample["metadata"]["adapter"]
 
-                # Build prompt
-                messages = []
+                # Build prompt - always inject system prompt to match preprocessing
+                messages = [{"role": "system", "content": EVAL_SYSTEM_PROMPT}]
+
                 for conv in sample["conversations"]:
+                    # Skip any system prompts in the data - we use our own
                     if conv["from"] == "system":
-                        messages.append({"role": "system", "content": conv["value"]})
+                        continue
                     elif conv["from"] == "human":
                         content = []
                         value = conv["value"]
@@ -1729,7 +1779,44 @@ def train_qwen3vl_lora(
     print(f"\nTo use this model for inference:")
     print(f"  modal run modal/inference.py --checkpoint-name {run_name}/final")
     print(f"\nTo download eval report locally:")
-    print(f"  uvx modal volume get moe-lora-data datasets/{base_dataset_name}/eval-report.json datasets/{base_dataset_name}/")
+    print(f"  uvx modal volume get {MOE_VOLUME_NAME} datasets/{base_dataset_name}/eval-report.json datasets/{base_dataset_name}/")
+
+    # ============================================================================
+    # Save comprehensive train-results.json for dashboard
+    # ============================================================================
+
+    train_results = {
+        "type": "router",  # mole-trainer-server produces router models
+        "dataset_name": dataset_name,
+        "run_name": run_name,
+        "completion_time": datetime.now().isoformat(),
+        "dataset": {
+            "train_samples": train_samples,
+            "val_samples": val_samples,
+            "total_samples": train_samples + val_samples,
+        },
+        "training": {
+            "total_steps": train_result.global_step,
+            "train_loss": train_result.training_loss,
+            "lora_rank": lora_rank,
+            "lora_alpha": lora_alpha,
+            "learning_rate": learning_rate,
+            "batch_size": batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+        },
+        "eval": eval_result if eval_result else {},
+        "output_dir": output_dir,
+        "log_dir": log_dir,
+    }
+
+    train_results_path = Path(output_dir) / "train-results.json"
+    with open(train_results_path, "w") as f:
+        json.dump(train_results, f, indent=2)
+
+    print(f"\n📄 Train results saved to: {train_results_path}")
+
+    # Commit volume with train results
+    moe_volume.commit()
 
     result = {
         "run_name": run_name,
@@ -1745,25 +1832,9 @@ def train_qwen3vl_lora(
     return result
 
 
-@app.function(
-    image=image,
-    volumes={"/moe-data": moe_volume},
-)
-@modal.web_server(8080, startup_timeout=60)
-def tensorboard():
-    """Serve tensorboard web UI"""
-    import subprocess
-    import sys
-
-    cmd = [
-        sys.executable, "-m", "tensorboard.main",
-        "--logdir=/moe-data/tb_logs",
-        "--host=0.0.0.0",
-        "--port=8080",
-        "--reload_interval=30",
-    ]
-
-    subprocess.Popen(cmd)
+# TensorBoard is served separately via projects/tensorboard-server
+# Run: modal deploy projects/tensorboard-server/modal/tensorboard.py
+# This keeps TensorBoard stable across training restarts.
 
 
 @app.local_entrypoint()

@@ -12,10 +12,52 @@ from pathlib import Path
 
 import modal
 
+# =============================================================================
+# CENTRALIZED CONFIGURATION
+# =============================================================================
+# Volume names and adapter info are loaded from config/adapters.yaml via the SDK.
+# Users can customize these by editing the YAML file.
+
+try:
+    from sdk.modal_compat import (
+        get_volume_name,
+        get_valid_experts,
+        get_base_vlm,
+    )
+    MOE_VOLUME_NAME = get_volume_name("moe_data")
+    VALID_ADAPTERS = get_valid_experts()
+    BASE_MODEL = get_base_vlm()
+    _adapter_names = "\n".join(f"- {name}" for name in sorted(VALID_ADAPTERS))
+    EVAL_SYSTEM_PROMPT = f"""You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
+
+Valid adapters names:
+{_adapter_names}
+
+What adapter name should handle this image and instruction?"""
+except ImportError:
+    # Fallback for Modal remote execution
+    MOE_VOLUME_NAME = "moe-lora-data"
+    VALID_ADAPTERS = {"calendar", "claim-window", "provider-select", "chandra",
+                      "appointment", "login-window", "desktop", "chart-screen"}
+    BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
+    EVAL_SYSTEM_PROMPT = """You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
+
+Valid adapters names:
+- appointment
+- calendar
+- chart-screen
+- chandra
+- claim-window
+- desktop
+- login-window
+- provider-select
+
+What adapter name should handle this image and instruction?"""
+
 app = modal.App("routing-lora-eval")
 
-# Volumes
-moe_volume = modal.Volume.from_name("moe-lora-data", create_if_missing=False)
+# Volumes (using centralized config)
+moe_volume = modal.Volume.from_name(MOE_VOLUME_NAME, create_if_missing=False)
 
 # Image with dependencies
 image = (
@@ -35,8 +77,6 @@ image = (
     )
 )
 
-VALID_ADAPTERS = {"calendar", "claim-window", "provider-select"}
-
 
 @app.function(
     image=image,
@@ -51,10 +91,11 @@ def evaluate_routing_lora(
     run_name: str,
     dataset_name: str,
     max_samples: int = 100,
+    checkpoint_step: int = None,  # Specific checkpoint step (e.g., 60 for checkpoint-60)
 ):
     """Evaluate routing LoRA accuracy on held-out eval data."""
     import torch
-    from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
     from peft import PeftModel
     from PIL import Image
     from qwen_vl_utils import process_vision_info
@@ -81,12 +122,19 @@ def evaluate_routing_lora(
     if not checkpoint_base.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_base}")
 
-    # Find best checkpoint (or final)
-    checkpoints = sorted(checkpoint_base.glob("checkpoint-*"), key=lambda x: int(x.name.split("-")[1]))
-    if checkpoints:
-        checkpoint_path = checkpoints[-1]  # Use latest
+    # Find checkpoint
+    if checkpoint_step is not None:
+        # Use specific checkpoint
+        checkpoint_path = checkpoint_base / f"checkpoint-{checkpoint_step}"
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     else:
-        checkpoint_path = checkpoint_base
+        # Find best checkpoint (or final)
+        checkpoints = sorted(checkpoint_base.glob("checkpoint-*"), key=lambda x: int(x.name.split("-")[1]))
+        if checkpoints:
+            checkpoint_path = checkpoints[-1]  # Use latest
+        else:
+            checkpoint_path = checkpoint_base
 
     print(f"Checkpoint: {checkpoint_path}")
 
@@ -110,10 +158,10 @@ def evaluate_routing_lora(
 
     # Load model
     print("\nLoading base model...")
-    model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
+    model_name = "Qwen/Qwen3-VL-8B-Instruct"
 
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
@@ -144,13 +192,14 @@ def evaluate_routing_lora(
         # Get ground truth
         expected_adapter = sample["metadata"]["adapter"]
 
-        # Build prompt from conversations
-        messages = []
+        # Build prompt - always inject system prompt to match preprocessing
+        messages = [{"role": "system", "content": EVAL_SYSTEM_PROMPT}]
         image_path = None
 
         for conv in sample["conversations"]:
+            # Skip any system prompts in the data - we use our own
             if conv["from"] == "system":
-                messages.append({"role": "system", "content": conv["value"]})
+                continue
             elif conv["from"] == "human":
                 content = []
                 value = conv["value"]
@@ -290,6 +339,7 @@ def main(
     run_name: str,
     dataset_name: str,
     max_samples: int = 100,
+    checkpoint_step: int = None,
 ):
     """Run evaluation and download report locally."""
     import subprocess
@@ -299,6 +349,7 @@ def main(
         run_name=run_name,
         dataset_name=dataset_name,
         max_samples=max_samples,
+        checkpoint_step=checkpoint_step,
     )
 
     print(f"\n{'='*70}")
