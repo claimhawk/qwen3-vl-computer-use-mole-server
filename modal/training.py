@@ -108,12 +108,17 @@ image = (
 )
 
 
+# Model cache volume for pre-downloaded HF models (avoids rate limiting)
+model_cache = modal.Volume.from_name("claimhawk-model-cache", create_if_missing=True)
+
+
 @app.function(
     image=image,
     gpu="H100:8",  # 8x H100 GPUs for faster training (same cost as 4x due to 2x speed)
     timeout=86400,  # 24 hours max
     volumes={
         "/moe-data": moe_volume,  # Single volume mount with subdirectories for each purpose
+        "/models": model_cache,  # Pre-cached HF models
     },
     secrets=[modal.Secret.from_name("huggingface-secret")],  # For model downloads
 )
@@ -553,14 +558,23 @@ def train_qwen3vl_lora(
     print("🤖 STEP 2: Loading Model")
     print(f"{'='*80}\n")
 
-    print(f"Loading model: {model_name}")
+    # Check for cached model (avoids HF rate limiting)
+    cached_model_path = f"/models/{model_name.replace('/', '--')}"
+    if os.path.exists(cached_model_path) and os.listdir(cached_model_path):
+        print(f"✅ Using cached model: {cached_model_path}")
+        model_path = cached_model_path
+    else:
+        print(f"📥 Downloading model from HF: {model_name}")
+        model_path = model_name
+
+    print(f"Loading model: {model_path}")
 
     # Load processor
-    processor = AutoProcessor.from_pretrained(model_name)
+    processor = AutoProcessor.from_pretrained(model_path)
 
     # Load model
     model = Qwen3VLForConditionalGeneration.from_pretrained(
-        model_name,
+        model_path,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         attn_implementation="flash_attention_2",  # Use flash attention

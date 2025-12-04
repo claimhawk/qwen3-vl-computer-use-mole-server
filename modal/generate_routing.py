@@ -2,10 +2,10 @@
 """Generate balanced routing dataset on Modal.
 
 Reads from claimhawk-training-data volume, generates balanced routing dataset,
-saves to moe-lora-data volume.
+saves to moe-lora-data volume. Configuration is loaded from config/dataset.yaml.
 
 Usage:
-    modal run modal/generate_routing.py --train-tasks 1000 --eval-tasks 100
+    modal run modal/generate_routing.py --seed 42
 """
 
 import json
@@ -79,29 +79,84 @@ app = modal.App("routing-dataset-generator")
 training_data_volume = modal.Volume.from_name(LORA_VOLUME_NAME, create_if_missing=False)
 moe_volume = modal.Volume.from_name(MOE_VOLUME_NAME, create_if_missing=True)
 
-image = modal.Image.debian_slim(python_version="3.12")
+image = modal.Image.debian_slim(python_version="3.12").pip_install("pyyaml")
 
 
-# Dataset mappings - loaded from config/loras.json locally, with fallback for Modal
-ADAPTER_DATASETS = {
-    "calendar": "calendar-mike-20251202_113010",
-    "claim-window": "procedure-scroll-mike-20251202_142525",
-    "provider-select": "provider-select-mike-20251202_144036",
-    "appointment": "appointment_20251202_111820",
-    "login-window": "login-window-michaeloneal-20251202_113305",
-    "desktop": "desktop-mike-20251201_214626",
-    "chart-screen": "chart-screen-mike-20251202_115044",
+# Dataset config - loaded from config/dataset.yaml locally, with fallback for Modal
+# Config structure:
+#   splits: {train, val, test} - ratios applied to each adapter's count
+#   adapters.<name>: {count, source (optional)} - set count to 0 to disable
+# Dataset names are resolved dynamically by finding the latest matching dataset
+
+DATASET_CONFIG = {
+    "splits": {"train": 0.8, "val": 0.2},
 }
-# Try to load from config (works locally, fails silently on Modal)
+TEST_SAMPLES_PER_ADAPTER = 100
+
+ADAPTER_CONFIGS = {
+    "calendar": {"count": 1000},
+    "claim-window": {"count": 1000},
+    "provider-select": {"count": 1000},
+    "appointment": {"count": 1000},
+    "login-window": {"count": 1000},
+    "desktop": {"count": 1000},
+    "chart-screen": {"count": 1000},
+    "chandra": {"count": 1000, "source": "ocr-generated"},
+}
+
+# Try to load from config/dataset.yaml (works locally, fails silently on Modal)
 try:
     import os as _os
-    _config_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "config", "loras.json")
+    import yaml as _yaml
+    _config_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "config", "dataset.yaml")
     with open(_config_path) as _f:
-        _config = json.load(_f)
-    ADAPTER_DATASETS = {name: info["dataset"] for name, info in _config["loras"].items() if "dataset" in info}
-    del _os, _config_path, _f, _config
-except FileNotFoundError:
+        _config = _yaml.safe_load(_f)
+    # Load splits
+    DATASET_CONFIG = {
+        "splits": _config.get("splits", DATASET_CONFIG["splits"]),
+    }
+    # Load adapter configs
+    if "adapters" in _config:
+        ADAPTER_CONFIGS = {}
+        for name, info in _config["adapters"].items():
+            ADAPTER_CONFIGS[name] = {
+                "count": info.get("count", 1000),
+                "source": info.get("source"),
+            }
+    del _os, _yaml, _config_path, _f, _config
+except (FileNotFoundError, ImportError):
     pass  # Use hardcoded fallback above
+
+
+def find_latest_dataset(adapter_name: str, datasets_dir: Path) -> str | None:
+    """Find the latest dataset for an adapter by scanning the datasets directory.
+
+    Dataset names follow pattern: {adapter_name}-{user}-{timestamp}
+    where timestamp is YYYYMMDD_HHMMSS. Returns the one with latest timestamp.
+    """
+    import re
+
+    if not datasets_dir.exists():
+        return None
+
+    # Match datasets starting with adapter name (allowing for various separators)
+    # e.g., calendar-mike-20251203, calendar--mike--20251203, appointment-user-20251203
+    pattern = re.compile(rf"^{re.escape(adapter_name)}[-_].*(\d{{8}}_\d{{6}})$")
+
+    matches = []
+    for d in datasets_dir.iterdir():
+        if d.is_dir():
+            match = pattern.match(d.name)
+            if match:
+                timestamp = match.group(1)
+                matches.append((timestamp, d.name))
+
+    if not matches:
+        return None
+
+    # Sort by timestamp descending, return latest
+    matches.sort(key=lambda x: x[0], reverse=True)
+    return matches[0][1]
 
 
 # OCR prompt templates for Chandra routing
@@ -152,8 +207,10 @@ def generate_ocr_samples(rng, count: int, images_dir: Path, ocr_source_dir: Path
     templates = list(OCR_PROMPT_TEMPLATES)
     rng.shuffle(templates)
 
-    # Get list of OCR images
-    ocr_images = sorted(ocr_source_dir.glob("*.png")) if ocr_source_dir.exists() else []
+    # Get list of OCR images (check both jpg and png)
+    ocr_images = sorted(ocr_source_dir.glob("*.jpg")) if ocr_source_dir.exists() else []
+    if not ocr_images:
+        ocr_images = sorted(ocr_source_dir.glob("*.png")) if ocr_source_dir.exists() else []
     if not ocr_images:
         print(f"  WARNING: No OCR images found in {ocr_source_dir}")
         return []
@@ -196,22 +253,38 @@ def generate_ocr_samples(rng, count: int, images_dir: Path, ocr_source_dir: Path
     timeout=3600,
 )
 def generate_routing_dataset(
-    train_tasks: int = 1000,
-    val_tasks: int = 100,
-    eval_tasks: int = 100,
     seed: int = 42,
 ):
-    """Generate balanced routing dataset from adapter sources + OCR.
+    """Generate routing dataset from adapter sources + OCR.
+
+    Uses config/dataset.yaml to determine:
+    - splits: {train, val} ratios applied to each adapter's count
+    - adapters: {name: {count}} - set count to 0 to disable
+    - Test is always 100 samples per adapter
 
     Creates three separate splits:
-    - train.jsonl: Training data (train_tasks total, balanced across adapters)
-    - val.jsonl: Validation data used during training for early stopping (val_tasks total)
-    - eval.jsonl: Held-out evaluation data for final accuracy testing (eval_tasks total)
+    - train.jsonl: Training data
+    - val.jsonl: Validation data for early stopping
+    - test.jsonl: Held-out test data (100 per adapter)
     """
+    # Load config
+    splits = DATASET_CONFIG["splits"]
+    adapter_configs = ADAPTER_CONFIGS
+    datasets_dir = Path("/training-data/datasets")
 
-    # Use pre-loaded adapter config
-    adapter_datasets = ADAPTER_DATASETS
-    num_adapters = len(adapter_datasets) + 1  # +1 for chandra
+    # Find latest dataset for each enabled adapter (count > 0, not ocr-generated)
+    adapter_datasets = {}
+    for name, cfg in adapter_configs.items():
+        count = cfg.get("count", 0)
+        if count <= 0:
+            continue
+        if cfg.get("source") == "ocr-generated":
+            continue  # Skip chandra - generated separately
+        dataset_name = find_latest_dataset(name, datasets_dir)
+        if dataset_name:
+            adapter_datasets[name] = dataset_name
+        else:
+            print(f"WARNING: No dataset found for adapter '{name}'")
 
     rng = random.Random(seed)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -220,26 +293,33 @@ def generate_routing_dataset(
     images_dir = output_dir / "images"
     images_dir.mkdir(exist_ok=True)
 
-    # Per-adapter targets (divide by num_adapters)
-    train_per_adapter = train_tasks // num_adapters
-    val_per_adapter = val_tasks // num_adapters
-    eval_per_adapter = eval_tasks // num_adapters
-
     print(f"\n{'='*70}")
-    print(f"Generating BALANCED Routing Dataset")
+    print(f"Generating Routing Dataset from config/dataset.yaml")
     print(f"{'='*70}")
     print(f"Output: {output_dir}")
-    print(f"Adapters: {list(adapter_datasets.keys())} + chandra")
-    print(f"Train: {train_tasks} total ({train_per_adapter} per adapter)")
-    print(f"Val: {val_tasks} total ({val_per_adapter} per adapter) - for training early stopping")
-    print(f"Eval: {eval_tasks} total ({eval_per_adapter} per adapter) - held-out for final accuracy")
+    print(f"Splits: train={splits['train']:.0%}, val={splits['val']:.0%}, test={TEST_SAMPLES_PER_ADAPTER} fixed")
+    print(f"\nAdapter counts:")
+    for name, cfg in adapter_configs.items():
+        count = cfg.get("count", 0)
+        if count > 0:
+            train_n = int(count * splits["train"])
+            val_n = int(count * splits["val"])
+            src = cfg.get("source") or adapter_datasets.get(name, "not found")
+            print(f"  {name}: {count} total -> train={train_n}, val={val_n}, test={TEST_SAMPLES_PER_ADAPTER} (from {src})")
     print(f"{'='*70}\n")
 
     all_train_samples = []
     all_val_samples = []
-    all_eval_samples = []
+    all_test_samples = []
 
     for adapter_name, dataset_name in adapter_datasets.items():
+        # Get per-adapter config
+        adapter_cfg = adapter_configs.get(adapter_name, {})
+        count = adapter_cfg.get("count", 1000)
+        train_target = int(count * splits["train"])
+        val_target = int(count * splits["val"])
+        test_target = TEST_SAMPLES_PER_ADAPTER
+
         label = ADAPTER_LABELS[adapter_name]
         dataset_path = Path(f"/training-data/datasets/{dataset_name}/train.jsonl")
         source_images_dir = Path(f"/training-data/datasets/{dataset_name}/images")
@@ -307,15 +387,15 @@ def generate_routing_dataset(
             return task_copy
 
         # Collect samples - iterate through images, grab ALL tasks from each image
-        # Split into train, val, eval using separate image pools (no leakage)
+        # Split into train, val, test using separate image pools (no leakage)
         train_samples = []
         val_samples = []
-        eval_samples = []
-        images_used = {"train": [], "val": [], "eval": []}
+        test_samples = []
+        images_used = {"train": [], "val": [], "test": []}
 
         # First pass: collect train samples
         for img in image_list:
-            if len(train_samples) >= train_per_adapter:
+            if len(train_samples) >= train_target:
                 break
             for task in tasks_by_image[img]:
                 train_samples.append(convert_to_routing_sample(task, adapter_name, label))
@@ -325,31 +405,31 @@ def generate_routing_dataset(
         for img in image_list:
             if img in images_used["train"]:
                 continue
-            if len(val_samples) >= val_per_adapter:
+            if len(val_samples) >= val_target:
                 break
             for task in tasks_by_image[img]:
                 val_samples.append(convert_to_routing_sample(task, adapter_name, label))
             images_used["val"].append(img)
 
-        # Third pass: collect eval samples from remaining images
+        # Third pass: collect test samples from remaining images
         for img in image_list:
             if img in images_used["train"] or img in images_used["val"]:
                 continue
-            if len(eval_samples) >= eval_per_adapter:
+            if len(test_samples) >= test_target:
                 break
             for task in tasks_by_image[img]:
-                eval_samples.append(convert_to_routing_sample(task, adapter_name, label))
-            images_used["eval"].append(img)
+                test_samples.append(convert_to_routing_sample(task, adapter_name, label))
+            images_used["test"].append(img)
 
         all_train_samples.extend(train_samples)
         all_val_samples.extend(val_samples)
-        all_eval_samples.extend(eval_samples)
+        all_test_samples.extend(test_samples)
 
-        print(f"  {adapter_name:20s} -> train={len(train_samples):4d}, val={len(val_samples):4d}, eval={len(eval_samples):4d}")
+        print(f"  {adapter_name:20s} -> train={len(train_samples):4d}, val={len(val_samples):4d}, test={len(test_samples):4d}")
 
         # Copy images
         images_copied = set()
-        for sample in train_samples + val_samples + eval_samples:
+        for sample in train_samples + val_samples + test_samples:
             img_path = sample.get("image", "")
             if img_path:
                 img_name = Path(img_path).name
@@ -367,28 +447,35 @@ def generate_routing_dataset(
                     images_copied.add(img_name)
                 sample["image"] = f"images/{img_name}"
 
-    # Generate OCR samples for Chandra
-    print(f"\nGenerating OCR samples for chandra...")
-    ocr_source_dir = Path("/moe-data/ocr-images/ocr")
-    ocr_train = generate_ocr_samples(rng, train_per_adapter, images_dir, ocr_source_dir)
-    ocr_val = generate_ocr_samples(rng, val_per_adapter, images_dir, ocr_source_dir)
-    ocr_eval = generate_ocr_samples(rng, eval_per_adapter, images_dir, ocr_source_dir)
+    # Generate OCR samples for Chandra (if count > 0)
+    chandra_cfg = adapter_configs.get("chandra", {})
+    chandra_count = chandra_cfg.get("count", 0)
+    if chandra_count > 0:
+        chandra_train = int(chandra_count * splits["train"])
+        chandra_val = int(chandra_count * splits["val"])
+        chandra_test = TEST_SAMPLES_PER_ADAPTER
 
-    all_train_samples.extend(ocr_train)
-    all_val_samples.extend(ocr_val)
-    all_eval_samples.extend(ocr_eval)
+        print(f"\nGenerating OCR samples for chandra...")
+        ocr_source_dir = Path("/moe-data/ocr-images/ocr")
+        ocr_train = generate_ocr_samples(rng, chandra_train, images_dir, ocr_source_dir)
+        ocr_val = generate_ocr_samples(rng, chandra_val, images_dir, ocr_source_dir)
+        ocr_test = generate_ocr_samples(rng, chandra_test, images_dir, ocr_source_dir)
 
-    print(f"  {'chandra':20s} -> train={len(ocr_train):4d}, val={len(ocr_val):4d}, eval={len(ocr_eval):4d}")
+        all_train_samples.extend(ocr_train)
+        all_val_samples.extend(ocr_val)
+        all_test_samples.extend(ocr_test)
+
+        print(f"  {'chandra':20s} -> train={len(ocr_train):4d}, val={len(ocr_val):4d}, test={len(ocr_test):4d}")
 
     # Shuffle all splits
     rng.shuffle(all_train_samples)
     rng.shuffle(all_val_samples)
-    rng.shuffle(all_eval_samples)
+    rng.shuffle(all_test_samples)
 
     print(f"\nTotal samples:")
     print(f"  Train: {len(all_train_samples)} (for training)")
     print(f"  Val: {len(all_val_samples)} (for early stopping during training)")
-    print(f"  Eval: {len(all_eval_samples)} (held-out for final accuracy)")
+    print(f"  Test: {len(all_test_samples)} (held-out for final accuracy)")
 
     # Check balance
     print(f"\nLabel distribution (train):")
@@ -406,11 +493,11 @@ def generate_routing_dataset(
                 f.write(json.dumps(item) + "\n")
         print(f"  Saved {len(data)} to {path.name}")
 
-    all_data = all_train_samples + all_val_samples + all_eval_samples
+    all_data = all_train_samples + all_val_samples + all_test_samples
     save_jsonl(output_dir / "data.jsonl", all_data)
     save_jsonl(output_dir / "train.jsonl", all_train_samples)
     save_jsonl(output_dir / "val.jsonl", all_val_samples)
-    save_jsonl(output_dir / "eval.jsonl", all_eval_samples)
+    save_jsonl(output_dir / "test.jsonl", all_test_samples)
 
     # Metadata
     adapters_meta = {name: {"label": ADAPTER_LABELS[name], "source": ds} for name, ds in adapter_datasets.items()}
@@ -420,8 +507,9 @@ def generate_routing_dataset(
         "dataset_name": "routing",
         "created_at": datetime.now().isoformat(),
         "seed": seed,
+        "splits": splits,
         "adapters": adapters_meta,
-        "samples": {"train": len(all_train_samples), "val": len(all_val_samples), "eval": len(all_eval_samples)},
+        "samples": {"train": len(all_train_samples), "val": len(all_val_samples), "test": len(all_test_samples)},
         "label_distribution_train": dist,
     }
     with open(output_dir / "metadata.json", "w") as f:
@@ -439,9 +527,6 @@ def generate_routing_dataset(
 
 @app.local_entrypoint()
 def main(
-    train_tasks: int = 1000,
-    val_tasks: int = 100,
-    eval_tasks: int = 100,
     seed: int = 42,
 ):
     import subprocess
@@ -450,12 +535,7 @@ def main(
     # Check if invoked from shell script - warn if not
     check_script_invocation()
 
-    dataset_name = generate_routing_dataset.remote(
-        train_tasks=train_tasks,
-        val_tasks=val_tasks,
-        eval_tasks=eval_tasks,
-        seed=seed,
-    )
+    dataset_name = generate_routing_dataset.remote(seed=seed)
     print(f"\nGenerated: {dataset_name}")
 
     # Download to local ./datasets/ for inspection

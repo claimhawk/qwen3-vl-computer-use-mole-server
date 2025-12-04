@@ -1,0 +1,45 @@
+# Dataset configuration for mole-trainer-server (routing dataset generator)
+
+name_prefix: routing
+seed: 42
+
+# Train/val split ratios (applied to each adapter's count)
+# Test is always 100 samples per adapter
+splits:
+  train: 0.8
+  val: 0.2
+
+# Adapter sources - generator finds latest dataset matching adapter name
+# count: total samples to pull from this adapter (set to 0 to disable)
+adapters:
+  calendar:
+    count: 1000
+
+  claim-window:
+    count: 1000
+
+  provider-select:
+    count: 1000
+
+  appointment:
+    count: 1000
+
+  login-window:
+    count: 1000
+
+  desktop:
+    count: 1000
+
+  chart-screen:
+    count: 1000
+
+  chandra:
+    count: 1000
+    source: ocr-generated
+
+# Output settings
+output:
+  image_format: jpg
+
+# System prompt for routing
+system_prompt: moe-router
