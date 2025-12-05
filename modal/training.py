@@ -78,6 +78,10 @@ checkpoints_volume = moe_volume
 logs_volume = moe_volume
 data_volume = moe_volume
 
+# Training history volume (shared with lora-trainer)
+HISTORY_VOLUME_NAME = "claimhawk-training-history"
+history_volume = modal.Volume.from_name(HISTORY_VOLUME_NAME, create_if_missing=True)
+
 # Docker Image with Dependencies
 # Use pre-compiled flash-attn wheel to avoid 10+ minute compilation
 # IMPORTANT: torch version must match the flash-attn wheel (torch2.4)
@@ -123,6 +127,7 @@ model_cache = modal.Volume.from_name("claimhawk-model-cache", create_if_missing=
     volumes={
         "/moe-data": moe_volume,  # Single volume mount with subdirectories for each purpose
         "/models": model_cache,  # Pre-cached HF models
+        "/history": history_volume,  # Training history (shared with lora-trainer)
     },
     secrets=[modal.Secret.from_name("huggingface-secret")],  # For model downloads
 )
@@ -1835,6 +1840,99 @@ def train_qwen3vl_lora(
 
     # Commit volume with train results
     moe_volume.commit()
+
+    # ============================================================================
+    # Save to training history (persistent across dataset cleanups)
+    # ============================================================================
+
+    print(f"\n{'='*80}")
+    print("📊 STEP 10: Saving Training History")
+    print(f"{'='*80}\n")
+
+    try:
+        # Read cost report for training time and cost
+        cost_report_path = Path(output_dir) / "cost_report.json"
+        training_time_hours = None
+        total_cost_usd = None
+        if cost_report_path.exists():
+            with open(cost_report_path) as f:
+                cost_report = json.load(f)
+                training_time_hours = cost_report.get("time", {}).get("total_hours")
+                total_cost_usd = cost_report.get("cost", {}).get("total_usd")
+
+        # Build history record
+        history_metrics = {
+            "val_loss": train_result.training_loss,  # Final training loss as proxy
+            "eval_accuracy": eval_result['accuracy']['overall'] if eval_result else None,
+            "per_class_accuracy": eval_result['accuracy']['per_class'] if eval_result else {},
+            "cost_usd": total_cost_usd,
+            "training_time_hours": training_time_hours,
+            "total_steps": train_result.global_step,
+            "early_stopped": early_stopping.patience_counter >= patience,
+            "dataset_size": {
+                "train": train_samples,
+                "val": val_samples,
+                "eval": len(eval_data) if 'eval_data' in dir() else 100,
+            },
+            "hyperparams": {
+                "lora_rank": lora_rank,
+                "lora_alpha": lora_alpha,
+                "learning_rate": learning_rate,
+                "batch_size": batch_size,
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "vision_lora_rank": vision_lora_rank,
+                "vision_lora_alpha": vision_lora_alpha,
+            },
+        }
+
+        # Save to history volume (inline since we can't import from same app)
+        run_id = f"{dataset_name}__{run_name}__{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        history_record = {
+            "run_id": run_id,
+            "type": "router",
+            "dataset_name": dataset_name,
+            "run_name": run_name,
+            "timestamp": datetime.now().isoformat(),
+            "metrics": {
+                "val_loss": history_metrics.get("val_loss"),
+                "eval_accuracy": history_metrics.get("eval_accuracy"),
+                "per_class_accuracy": history_metrics.get("per_class_accuracy", {}),
+                "cost_usd": history_metrics.get("cost_usd"),
+                "training_time_hours": history_metrics.get("training_time_hours"),
+                "total_steps": history_metrics.get("total_steps"),
+                "early_stopped": history_metrics.get("early_stopped", False),
+            },
+            "dataset_size": history_metrics.get("dataset_size", {}),
+            "hyperparams": history_metrics.get("hyperparams", {}),
+        }
+
+        # Router history goes in /history/router
+        router_dir = Path("/history/router")
+        router_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save individual record
+        record_path = router_dir / f"{run_id}.json"
+        with open(record_path, "w") as f:
+            json.dump(history_record, f, indent=2)
+
+        # Append to JSONL log
+        log_path = router_dir / "runs.jsonl"
+        with open(log_path, "a") as f:
+            f.write(json.dumps(history_record) + "\n")
+
+        # Commit history volume
+        history_volume.commit()
+
+        print(f"✅ Training history saved: {run_id}")
+        print(f"   Eval Accuracy: {history_record['metrics']['eval_accuracy']:.1f}%" if history_record['metrics']['eval_accuracy'] else "   Eval Accuracy: N/A")
+        if history_record['metrics']['cost_usd']:
+            print(f"   Cost: ${history_record['metrics']['cost_usd']:.2f}")
+        print(f"   View history: uvx modal run modal/history.py")
+
+    except Exception as e:
+        print(f"⚠️  Warning: Could not save training history: {e}")
+        import traceback
+        traceback.print_exc()
 
     result = {
         "run_name": run_name,
