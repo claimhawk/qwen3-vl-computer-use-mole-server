@@ -318,7 +318,10 @@ def preprocess_dataset_impl(dataset_name: str):
 
             full_path = Path(dataset_base_path) / img_path_str
 
-        return full_path if full_path.exists() else None
+        if not full_path.exists():
+            print(f"⚠️  Image not found: {full_path}")
+            return None
+        return full_path
 
     def process_single_image(img_path: str) -> tuple[str, dict[str, Any] | None]:
         """Process a single image and return (img_path, cached_data) tuple."""
@@ -368,7 +371,16 @@ def preprocess_dataset_impl(dataset_name: str):
                 failed_images.append(img_path)
 
     if failed_images:
-        print(f"⚠️  Warning: {len(failed_images)} images failed to load")
+        print(f"\n❌ ERROR: {len(failed_images)} images failed to load!")
+        print("First 10 missing images:")
+        for img in failed_images[:10]:
+            print(f"   - {img}")
+        if len(failed_images) > 10:
+            print(f"   ... and {len(failed_images) - 10} more")
+        raise RuntimeError(
+            f"Cannot proceed: {len(failed_images)} images missing. "
+            "Ensure all referenced datasets are uploaded to the training-data volume."
+        )
 
     print(f"✅ Cached {len(image_cache)} images")
 
