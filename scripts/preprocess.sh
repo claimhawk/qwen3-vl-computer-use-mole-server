@@ -1,7 +1,7 @@
 #!/bin/bash
 # Preprocess Qwen3-VL datasets on Modal.
 #
-# Pipeline: generate_dataset.sh -> preprocess.sh -> train.sh
+# Pipeline: generate.sh -> upload.sh -> preprocess.sh -> train.sh
 
 set -euo pipefail
 
@@ -35,7 +35,7 @@ fi
 RUN_NAME=$(basename "$DATASET_NAME" | tr '_' '-')
 
 echo "========================================"
-echo "STAGE 2: Preprocess Dataset"
+echo "STAGE 3: Preprocess Dataset"
 echo "========================================"
 echo ""
 echo "Dataset: $DATASET_NAME"

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025 Tylt LLC. All rights reserved.
+# Licensed for research use only. Commercial use requires a license from Tylt LLC.
+# Contact: hello@claimhawk.app | See LICENSE for terms.
+
 # Version: 2025-12-02-v6 - Separate prompts: ROUTER for routing, COMPUTER_USE for task LoRAs
 """Stacked inference: Routing LoRA → Task LoRA or Chandra.
 

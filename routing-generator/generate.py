@@ -1,3 +1,7 @@
+# Copyright (c) 2025 Tylt LLC. All rights reserved.
+# Licensed for research use only. Commercial use requires a license from Tylt LLC.
+# Contact: hello@claimhawk.app | See LICENSE for terms.
+
 """Merge task datasets into a routing JSONL with adapter labels."""
 
 from __future__ import annotations

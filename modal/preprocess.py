@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025 Tylt LLC. All rights reserved.
+# Licensed for research use only. Commercial use requires a license from Tylt LLC.
+# Contact: hello@claimhawk.app | See LICENSE for terms.
+
 """
 Qwen3-VL Data Preprocessing on Modal
 
@@ -42,7 +46,7 @@ What adapter name should handle this image and instruction?"""
 except ImportError:
     # Fallback for Modal remote execution
     MOE_VOLUME_NAME = "moe-lora-data"
-    TRAINING_DATA_VOLUME_NAME = "claimhawk-training-data"
+    TRAINING_DATA_VOLUME_NAME = "claimhawk-lora-training"
     BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
     SYSTEM_PROMPT = """You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
 
@@ -63,6 +67,7 @@ app = modal.App("moe-lora-preprocessing")
 
 # Volume - defined at module level so we can reload it (using centralized config)
 VOLUME = modal.Volume.from_name(MOE_VOLUME_NAME, create_if_missing=True)
+TRAINING_DATA_VOLUME = modal.Volume.from_name(TRAINING_DATA_VOLUME_NAME, create_if_missing=True)
 
 # Docker Image with Dependencies (CPU-only, no GPU needed)
 image = (
@@ -88,6 +93,7 @@ image = (
     timeout=7200,  # 2 hours max
     volumes={
         "/data": VOLUME,
+        "/training-data": TRAINING_DATA_VOLUME,  # For resolving image paths
     },
 )
 def preprocess_dataset_impl(dataset_name: str):
@@ -280,43 +286,89 @@ def preprocess_dataset_impl(dataset_name: str):
     # Cache for processed image tensors
     image_cache = {}
 
-    print("\nProcessing unique images...")
-    for img_path in tqdm(sorted(unique_images), desc="Caching images"):
-        # Skip empty image paths (e.g., OCR samples without images)
-        if not img_path or img_path == "":
-            continue
+    # Reload training-data volume to see images
+    TRAINING_DATA_VOLUME.reload()
+    training_data_root = Path("/training-data/datasets")
 
-        # Image paths in JSONL might be like "calendar_20251114_224610/images/screen_2024_01.png"
-        # But dataset_base_path is "/training_data/calendar_20251114_224610/calendar_20251114_224610"
-        # So we need to strip the first component if it matches the base dataset name
+    def resolve_image_path(img_path: str) -> Path | None:
+        """Resolve an image path to its full filesystem path."""
+        if not img_path or img_path == "":
+            return None
+
         img_path_str = str(img_path)
 
-        # Extract the base dataset name (first part if nested like "calendar_x/calendar_x")
-        base_dataset_name = dataset_name.split('/')[0] if '/' in dataset_name else dataset_name
+        # MoE routing datasets store image paths as:
+        #   {source_dataset}/images/{filename} or
+        #   {source_dataset}/ocr/images/{filename}
+        # These resolve to /training-data/datasets/{source_dataset}/images/{filename}
 
-        # If image path starts with the base dataset name, strip it to avoid duplication
-        if img_path_str.startswith(f"{base_dataset_name}/"):
-            # Strip the base name prefix: "calendar_20251114_224610/images/..." → "images/..."
-            img_path_str = img_path_str[len(base_dataset_name)+1:]
+        # Check if this is a cross-dataset reference (starts with a dataset name)
+        if "/" in img_path_str and not img_path_str.startswith("images/"):
+            # It's a cross-dataset reference, resolve from training-data volume
+            full_path = training_data_root / img_path_str
+        else:
+            # Legacy path: relative to the routing dataset itself
+            # Extract the base dataset name (first part if nested like "calendar_x/calendar_x")
+            base_dataset_name_local = dataset_name.split('/')[0] if '/' in dataset_name else dataset_name
 
-        full_path = Path(dataset_base_path) / img_path_str
-        if not full_path.exists():
-            print(f"⚠️  Warning: Image not found: {full_path}")
-            continue
+            # If image path starts with the base dataset name, strip it to avoid duplication
+            if img_path_str.startswith(f"{base_dataset_name_local}/"):
+                # Strip the base name prefix: "calendar_20251114_224610/images/..." → "images/..."
+                img_path_str = img_path_str[len(base_dataset_name_local)+1:]
 
-        # Process image using the processor
-        image = Image.open(full_path)
-        # Get image tensor directly without text
-        image_inputs, _ = process_vision_info(
-            [{"role": "user", "content": [{"type": "image", "image": f"file://{full_path}"}]}],
-            image_patch_size=16
-        )
+            full_path = Path(dataset_base_path) / img_path_str
 
-        # Cache the processed image tensor using original img_path as key
-        image_cache[img_path] = {
-            "pixel_values": image_inputs[0] if image_inputs else None,
-            "image": image
-        }
+        return full_path if full_path.exists() else None
+
+    def process_single_image(img_path: str) -> tuple[str, dict[str, Any] | None]:
+        """Process a single image and return (img_path, cached_data) tuple."""
+        full_path = resolve_image_path(img_path)
+        if full_path is None:
+            return (img_path, None)
+
+        try:
+            # Process image using the processor
+            image = Image.open(full_path)
+            # Get image tensor directly without text
+            image_inputs, _ = process_vision_info(
+                [{"role": "user", "content": [{"type": "image", "image": f"file://{full_path}"}]}],
+                image_patch_size=16
+            )
+
+            return (img_path, {
+                "pixel_values": image_inputs[0] if image_inputs else None,
+                "image": image
+            })
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to process image {full_path}: {e}")
+            return (img_path, None)
+
+    # Parallel image caching using ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import multiprocessing
+
+    # Use 8 workers (good balance for I/O-bound image loading + CPU processing)
+    num_workers = min(8, multiprocessing.cpu_count())
+    print(f"\nProcessing unique images with {num_workers} parallel workers...")
+
+    # Filter out empty paths first
+    valid_images = [p for p in sorted(unique_images) if p and p != ""]
+    failed_images = []
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks
+        future_to_path = {executor.submit(process_single_image, p): p for p in valid_images}
+
+        # Process results as they complete with progress bar
+        for future in tqdm(as_completed(future_to_path), total=len(valid_images), desc="Caching images"):
+            img_path, cached_data = future.result()
+            if cached_data is not None:
+                image_cache[img_path] = cached_data
+            else:
+                failed_images.append(img_path)
+
+    if failed_images:
+        print(f"⚠️  Warning: {len(failed_images)} images failed to load")
 
     print(f"✅ Cached {len(image_cache)} images")
 

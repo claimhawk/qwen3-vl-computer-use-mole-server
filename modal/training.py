@@ -1,3 +1,7 @@
+# Copyright (c) 2025 Tylt LLC. All rights reserved.
+# Licensed for research use only. Commercial use requires a license from Tylt LLC.
+# Contact: hello@claimhawk.app | See LICENSE for terms.
+
 # Version: 2025-12-02-v8 - Eval injects system prompt to match preprocessing
 """
 Qwen3-VL LoRA Fine-tuning on Modal

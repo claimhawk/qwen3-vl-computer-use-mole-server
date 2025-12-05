@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025 Tylt LLC. All rights reserved.
+# Licensed for research use only. Commercial use requires a license from Tylt LLC.
+# Contact: hello@claimhawk.app | See LICENSE for terms.
+
 """Generate balanced routing dataset on Modal.
 
 Reads from claimhawk-training-data volume, generates balanced routing dataset,
@@ -202,33 +206,79 @@ OCR_PROMPT_TEMPLATES = [
 ]
 
 
-def generate_ocr_samples(rng, count: int, images_dir: Path, ocr_source_dir: Path) -> list[dict]:
-    """Generate OCR routing samples for Chandra using actual OCR images."""
+def find_ocr_folders(datasets_dir: Path) -> list[Path]:
+    """Find all OCR folders in dataset directories.
+
+    Scans /training-data/datasets/*/ocr/images/ for OCR images generated
+    by the screen generators.
+    """
+    ocr_folders = []
+    if not datasets_dir.exists():
+        return ocr_folders
+
+    for dataset_dir in datasets_dir.iterdir():
+        if dataset_dir.is_dir():
+            ocr_images_dir = dataset_dir / "ocr" / "images"
+            if ocr_images_dir.exists():
+                ocr_folders.append(ocr_images_dir)
+
+    return ocr_folders
+
+
+def generate_ocr_samples(
+    rng: random.Random,
+    count: int,
+    images_dir: Path,
+    datasets_dir: Path,
+) -> list[dict]:
+    """Generate OCR routing samples for Chandra using OCR images from generators.
+
+    Scans all dataset OCR folders in /training-data/datasets/*/ocr/images/
+    and collects images for use in chandra routing training.
+    """
     templates = list(OCR_PROMPT_TEMPLATES)
     rng.shuffle(templates)
 
-    # Get list of OCR images (check both jpg and png)
-    ocr_images = sorted(ocr_source_dir.glob("*.jpg")) if ocr_source_dir.exists() else []
-    if not ocr_images:
-        ocr_images = sorted(ocr_source_dir.glob("*.png")) if ocr_source_dir.exists() else []
-    if not ocr_images:
-        print(f"  WARNING: No OCR images found in {ocr_source_dir}")
+    # Find all OCR folders from generators
+    ocr_folders = find_ocr_folders(datasets_dir)
+    if not ocr_folders:
+        print(f"  WARNING: No OCR folders found in {datasets_dir}/*/ocr/images/")
         return []
 
-    # Copy OCR images to output images dir
-    for img in ocr_images:
-        dst = images_dir / f"ocr_{img.name}"
+    # Collect all OCR images from all folders
+    ocr_images = []
+    for folder in ocr_folders:
+        # Check both jpg and png
+        ocr_images.extend(sorted(folder.glob("*.jpg")))
+        ocr_images.extend(sorted(folder.glob("*.png")))
+
+    if not ocr_images:
+        print(f"  WARNING: No OCR images found in {len(ocr_folders)} OCR folders")
+        return []
+
+    print(f"  Found {len(ocr_images)} OCR images in {len(ocr_folders)} folders")
+
+    # Shuffle images for variety
+    rng.shuffle(ocr_images)
+
+    # Copy OCR images to output images dir (with unique names to avoid collisions)
+    copied_images = []
+    for i, img in enumerate(ocr_images):
+        # Use index prefix to ensure unique names across folders
+        dst_name = f"ocr_{i:05d}_{img.name}"
+        dst = images_dir / dst_name
         if not dst.exists():
             shutil.copy2(img, dst)
+        copied_images.append(dst_name)
 
     samples = []
     for i in range(count):
         prompt = templates[i % len(templates)]
         # Cycle through available OCR images
-        img = ocr_images[i % len(ocr_images)]
+        img_name = copied_images[i % len(copied_images)]
         sample = {
             "id": f"ocr_{i:04d}",
-            "image": f"images/ocr_{img.name}",
+            "image": f"images/{img_name}",
             "conversations": [
                 # No system prompt - preprocessor will add it
                 {"from": "human", "value": f"<image>\n{prompt}"},
@@ -456,10 +506,10 @@ def generate_routing_dataset(
         chandra_test = TEST_SAMPLES_PER_ADAPTER
 
         print(f"\nGenerating OCR samples for chandra...")
-        ocr_source_dir = Path("/moe-data/ocr-images/ocr")
-        ocr_train = generate_ocr_samples(rng, chandra_train, images_dir, ocr_source_dir)
-        ocr_val = generate_ocr_samples(rng, chandra_val, images_dir, ocr_source_dir)
-        ocr_test = generate_ocr_samples(rng, chandra_test, images_dir, ocr_source_dir)
+        # Use OCR images from generator datasets (*/ocr/images/)
+        ocr_train = generate_ocr_samples(rng, chandra_train, images_dir, datasets_dir)
+        ocr_val = generate_ocr_samples(rng, chandra_val, images_dir, datasets_dir)
+        ocr_test = generate_ocr_samples(rng, chandra_test, images_dir, datasets_dir)
 
         all_train_samples.extend(ocr_train)
         all_val_samples.extend(ocr_val)
