@@ -6,3 +6,14 @@ logs/
 .env.*
 !.env.example
 archives/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Images directory
+images/
