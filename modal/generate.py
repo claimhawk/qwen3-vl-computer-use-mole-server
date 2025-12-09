@@ -485,10 +485,13 @@ def main(
     # Parse accuracy from output
     new_accuracy = None
     for line in result.stdout.split("\n"):
-        if "Overall Accuracy:" in line:
-            # Extract percentage like "Overall Accuracy: 85.00%"
+        if "Overall Accuracy:" in line or "Overall accuracy:" in line:
+            # Format: "Overall Accuracy: X/Y (Z%)" or "Overall accuracy: Z%"
             try:
-                new_accuracy = float(line.split(":")[1].strip().replace("%", ""))
+                import re
+                match = re.search(r'(\d+\.?\d*)%', line)
+                if match:
+                    new_accuracy = float(match.group(1))
             except (IndexError, ValueError):
                 pass
 
@@ -507,9 +510,13 @@ def main(
     deployed_accuracy = None
     if deployed_result.returncode == 0:
         for line in deployed_result.stdout.split("\n"):
-            if "Overall Accuracy:" in line:
+            if "Overall Accuracy:" in line or "Overall accuracy:" in line:
+                # Format: "Overall Accuracy: X/Y (Z%)" or "Overall accuracy: Z%"
                 try:
-                    deployed_accuracy = float(line.split(":")[1].strip().replace("%", ""))
+                    import re
+                    match = re.search(r'(\d+\.?\d*)%', line)
+                    if match:
+                        deployed_accuracy = float(match.group(1))
                 except (IndexError, ValueError):
                     pass
         print(deployed_result.stdout)
@@ -517,21 +524,29 @@ def main(
         print("No deployed router found or test failed - will deploy new model")
 
     # Compare and deploy if improved
+    # SAFETY: Only deploy if we can properly compare both accuracies
     should_deploy = False
-    if new_accuracy is not None:
-        if deployed_accuracy is None:
-            print(f"\nNo deployed model to compare. New accuracy: {new_accuracy:.2f}%")
-            should_deploy = True
-        elif new_accuracy > deployed_accuracy:
-            print(f"\n✅ NEW MODEL IS BETTER!")
-            print(f"   New: {new_accuracy:.2f}% vs Deployed: {deployed_accuracy:.2f}%")
+    if new_accuracy is None:
+        print("❌ Could not parse new model accuracy - skipping deployment")
+    elif deployed_accuracy is None:
+        # No deployed model OR couldn't parse deployed accuracy
+        # Only auto-deploy if there's truly no deployed model (check returncode)
+        if deployed_result.returncode != 0:
+            print(f"\n⚠️  No deployed model found. New accuracy: {new_accuracy:.2f}%")
+            print("   Will deploy since there's no existing router.")
             should_deploy = True
         else:
-            print(f"\n❌ New model not better than deployed")
-            print(f"   New: {new_accuracy:.2f}% vs Deployed: {deployed_accuracy:.2f}%")
-            print("   Skipping deployment")
+            print(f"\n❌ Could not parse deployed model accuracy - skipping deployment for safety")
+            print(f"   New accuracy: {new_accuracy:.2f}%")
+            print("   Run manual deployment if desired: modal run modal/deploy.py --latest")
+    elif new_accuracy > deployed_accuracy:
+        print(f"\n✅ NEW MODEL IS BETTER!")
+        print(f"   New: {new_accuracy:.2f}% vs Deployed: {deployed_accuracy:.2f}%")
+        should_deploy = True
     else:
-        print("Could not parse new model accuracy - skipping deployment")
+        print(f"\n❌ New model not better than deployed")
+        print(f"   New: {new_accuracy:.2f}% vs Deployed: {deployed_accuracy:.2f}%")
+        print("   Skipping deployment")
 
     if should_deploy:
         print("\nDeploying new model...")
