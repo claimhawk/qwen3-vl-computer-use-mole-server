@@ -4,37 +4,37 @@ name_prefix: routing
 seed: 42
 
 # Train/val split ratios (applied to each adapter's count)
-# Test is always 100 samples per adapter
 splits:
   train: 0.8
   val: 0.2
 
+# Test samples per adapter (25 per adapter = 175 total for 7 adapters)
+test_samples_per_adapter: 25
+
 # Adapter sources - generator finds latest dataset matching adapter name
 # count: total samples to pull from this adapter (set to 0 to disable)
+# 500 samples per adapter is sufficient for router training
 adapters:
   calendar:
-    count: 1000
+    count: 500
 
   claim-window:
-    count: 1000
-
-  provider-select:
-    count: 1000
+    count: 500
 
   appointment:
-    count: 1000
+    count: 500
 
   login-window:
-    count: 1000
+    count: 500
 
   desktop:
-    count: 1000
+    count: 500
 
   chart-screen:
-    count: 1000
+    count: 500
 
-  chandra:
-    count: 1000
+  ocr:
+    count: 500
     source: ocr-generated
 
 # Output settings

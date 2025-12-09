@@ -8,10 +8,11 @@
 # dependencies = ["pyyaml>=6.0"]
 # ///
 
-"""Generate MoE routing dataset locally.
+"""Generate MoE routing dataset from deployed experts on Modal.
 
-Reads from generator project datasets and creates a balanced routing dataset.
-The dataset is saved locally, then uploaded to Modal via scripts/upload.sh.
+Queries Modal's training-history volume for the latest deployed dataset per expert,
+downloads the datasets from claimhawk-lora-training, and creates a balanced
+routing dataset. The dataset is saved locally, then uploaded to Modal.
 
 Usage:
     python generator.py
@@ -22,51 +23,77 @@ import argparse
 import json
 import os
 import random
-import sys
+import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
 import yaml
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION - Load from adapters.yaml (single source of truth)
 # =============================================================================
 
-ADAPTER_LABELS = {
-    "calendar": 0,
-    "claim-window": 1,
-    "provider-select": 2,
-    "chandra": 3,
-    "desktop": 4,
-    "appointment": 5,
-    "login-window": 6,
-    "chart-screen": 7,
-}
 
-# Map adapter names to their generator project directories
-ADAPTER_GENERATORS = {
-    "calendar": "calendar-generator",
-    "claim-window": "claim-window-generator",
-    "provider-select": "claim-window-generator",  # provider-select is in claim-window-generator
-    "appointment": "appointment-generator",
-    "login-window": "login-window-generator",
-    "desktop": "desktop-generator",
-    "chart-screen": "chart-screen-generator",
-}
+def _load_adapters_config() -> dict:
+    """Load adapter configuration from adapters.yaml."""
+    # Look for adapters.yaml in config/ relative to parent directory
+    script_dir = Path(__file__).parent
+    config_path = script_dir.parent / "config" / "adapters.yaml"
+    if not config_path.exists():
+        # Fallback to common locations
+        for path in [
+            Path.home() / "development/claimhawk/config/adapters.yaml",
+            Path("/Users/michaeloneal/development/claimhawk/config/adapters.yaml"),
+        ]:
+            if path.exists():
+                config_path = path
+                break
+    if not config_path.exists():
+        raise FileNotFoundError(f"adapters.yaml not found at {config_path}")
+    with open(config_path) as f:
+        return yaml.safe_load(f)
 
-# Default config
+
+def _get_adapter_labels() -> dict[str, int]:
+    """Get adapter labels from adapters.yaml."""
+    config = _load_adapters_config()
+    labels = {}
+    for name, expert in config.get("experts", {}).items():
+        if "label" in expert:
+            labels[name] = expert["label"]
+    return labels
+
+
+def _get_adapter_generators() -> dict[str, str]:
+    """Get adapter -> generator mapping from adapters.yaml."""
+    config = _load_adapters_config()
+    generators = {}
+    for name, expert in config.get("experts", {}).items():
+        gen = expert.get("generator")
+        if gen:
+            generators[name] = gen
+    return generators
+
+
+# Load from adapters.yaml
+ADAPTER_LABELS = _get_adapter_labels()
+ADAPTER_GENERATORS = _get_adapter_generators()
+
+# Modal volume names (from adapters.yaml)
+_config = _load_adapters_config()
+TRAINING_HISTORY_VOLUME = _config.get("volumes", {}).get("training_history", {}).get("name", "claimhawk-training-history")
+LORA_TRAINING_VOLUME = _config.get("volumes", {}).get("lora_training", {}).get("name", "claimhawk-lora-training")
+
+# Default config - adapters from YAML with default counts
+# 500 samples per adapter is sufficient for router training
+# Test: 25 samples per adapter
 DEFAULT_CONFIG = {
     "splits": {"train": 0.8, "val": 0.2},
-    "test_samples_per_adapter": 100,
+    "test_samples_per_adapter": 25,
     "adapters": {
-        "calendar": {"count": 1000},
-        "claim-window": {"count": 1000},
-        "provider-select": {"count": 1000},
-        "appointment": {"count": 1000},
-        "login-window": {"count": 1000},
-        "desktop": {"count": 1000},
-        "chart-screen": {"count": 1000},
-        "chandra": {"count": 1000, "source": "ocr-generated"},
+        name: {"count": 500} if name != "ocr" else {"count": 500, "source": "ocr-generated"}
+        for name in ADAPTER_LABELS.keys()
     },
 }
 
@@ -152,38 +179,112 @@ def find_generators_root() -> Path:
     raise FileNotFoundError("Cannot find generators root directory")
 
 
-def find_latest_dataset(adapter_name: str, generators_root: Path) -> tuple[str, Path] | None:
-    """Find the latest dataset for an adapter in local generator projects.
+def get_deployed_dataset_from_modal(adapter_name: str) -> str | None:
+    """Get the latest deployed dataset name for an adapter from Modal training history.
+
+    Returns dataset_name or None if not found.
+    """
+    try:
+        # Download runs.jsonl from training history
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            temp_path = f.name
+
+        result = subprocess.run(
+            [
+                "uvx", "modal", "volume", "get",
+                TRAINING_HISTORY_VOLUME,
+                f"/{adapter_name}/runs.jsonl",
+                temp_path,
+                "--force",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            print(f"  Warning: No training history for {adapter_name}")
+            return None
+
+        # Read the last line (most recent run)
+        with open(temp_path) as f:
+            lines = f.readlines()
+            if not lines:
+                return None
+            last_run = json.loads(lines[-1])
+            dataset_name = last_run.get("dataset_name")
+            return dataset_name
+
+    except Exception as e:
+        print(f"  Warning: Failed to get training history for {adapter_name}: {e}")
+        return None
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def download_dataset_from_modal(dataset_name: str, local_dir: Path) -> Path | None:
+    """Download a dataset from Modal's lora-training volume.
+
+    Returns the local path to the downloaded dataset or None if failed.
+    """
+    dataset_path = local_dir / dataset_name
+    dataset_path.mkdir(parents=True, exist_ok=True)
+
+    # Download train.jsonl
+    train_path = dataset_path / "train.jsonl"
+    result = subprocess.run(
+        [
+            "uvx", "modal", "volume", "get",
+            LORA_TRAINING_VOLUME,
+            f"/datasets/{dataset_name}/train.jsonl",
+            str(train_path),
+            "--force",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        print(f"  Error downloading {dataset_name}/train.jsonl: {result.stderr}")
+        return None
+
+    return dataset_path
+
+
+def find_latest_dataset(
+    adapter_name: str,
+    generators_root: Path,
+    cache_dir: Path | None = None,
+) -> tuple[str, Path] | None:
+    """Find the latest deployed dataset for an adapter from Modal.
+
+    Queries training-history volume for the deployed dataset, then downloads
+    from lora-training volume.
 
     Returns (dataset_name, dataset_path) or None if not found.
     """
-    import re
-
-    generator_name = ADAPTER_GENERATORS.get(adapter_name)
-    if not generator_name:
+    # Get dataset name from Modal training history
+    dataset_name = get_deployed_dataset_from_modal(adapter_name)
+    if not dataset_name:
+        print(f"  No deployed dataset found for {adapter_name}")
         return None
 
-    datasets_dir = generators_root / generator_name / "datasets"
-    if not datasets_dir.exists():
+    # Use cache dir if provided, else use temp directory
+    if cache_dir is None:
+        cache_dir = Path(tempfile.gettempdir()) / "moe-routing-datasets"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if already cached
+    cached_path = cache_dir / dataset_name
+    if cached_path.exists() and (cached_path / "train.jsonl").exists():
+        return dataset_name, cached_path
+
+    # Download from Modal
+    dataset_path = download_dataset_from_modal(dataset_name, cache_dir)
+    if dataset_path is None:
         return None
 
-    # Match datasets starting with adapter name
-    pattern = re.compile(rf"^{re.escape(adapter_name)}[-_].*(\d{{8}}_\d{{6}})$")
-
-    matches = []
-    for d in datasets_dir.iterdir():
-        if d.is_dir():
-            match = pattern.match(d.name)
-            if match:
-                timestamp = match.group(1)
-                matches.append((timestamp, d.name, d))
-
-    if not matches:
-        return None
-
-    # Sort by timestamp descending, return latest
-    matches.sort(key=lambda x: x[0], reverse=True)
-    return matches[0][1], matches[0][2]
+    return dataset_name, dataset_path
 
 
 def convert_to_routing_sample(
@@ -240,12 +341,48 @@ def convert_to_routing_sample(
     return sample
 
 
+def get_ocr_images_from_modal(deployed_datasets: dict[str, str]) -> list[tuple[str, str]]:
+    """Get OCR image paths from deployed datasets on Modal.
+
+    Returns list of (dataset_name, relative_path) tuples.
+    """
+    ocr_images: list[tuple[str, str]] = []
+
+    for adapter_name, dataset_name in deployed_datasets.items():
+        # List OCR images from this dataset on Modal
+        result = subprocess.run(
+            [
+                "uvx", "modal", "volume", "ls",
+                LORA_TRAINING_VOLUME,
+                f"/datasets/{dataset_name}/ocr/images/",
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            # No OCR folder for this dataset, that's OK
+            continue
+
+        # Parse the listing - each line is a full path like datasets/{name}/ocr/images/file.jpg
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            # Extract just the filename
+            if "/" in line:
+                filename = line.split("/")[-1]
+                if filename.endswith((".jpg", ".png")):
+                    ocr_images.append((dataset_name, f"ocr/images/{filename}"))
+
+    return ocr_images
+
+
 def generate_ocr_samples(
     rng: random.Random,
     count: int,
-    generators_root: Path,
+    deployed_datasets: dict[str, str],
 ) -> list[dict]:
-    """Generate OCR routing samples for Chandra.
+    """Generate OCR routing samples from deployed datasets on Modal.
 
     Image paths are stored as {dataset-name}/ocr/images/{filename} so they can be
     resolved on Modal as /training-data/datasets/{dataset-name}/ocr/images/{filename}.
@@ -253,29 +390,11 @@ def generate_ocr_samples(
     templates = list(OCR_PROMPT_TEMPLATES)
     rng.shuffle(templates)
 
-    # Find all OCR folders and collect images with their dataset info
-    ocr_images: list[tuple[str, str]] = []  # (dataset_name, relative_path)
-
-    for generator_dir in generators_root.iterdir():
-        if not generator_dir.is_dir() or not generator_dir.name.endswith("-generator"):
-            continue
-
-        datasets_dir = generator_dir / "datasets"
-        if not datasets_dir.exists():
-            continue
-
-        for dataset_dir in datasets_dir.iterdir():
-            if dataset_dir.is_dir():
-                ocr_images_dir = dataset_dir / "ocr" / "images"
-                if ocr_images_dir.exists():
-                    dataset_name = dataset_dir.name
-                    for img_file in ocr_images_dir.glob("*.png"):
-                        ocr_images.append((dataset_name, f"ocr/images/{img_file.name}"))
-                    for img_file in ocr_images_dir.glob("*.jpg"):
-                        ocr_images.append((dataset_name, f"ocr/images/{img_file.name}"))
+    # Get OCR images from deployed datasets on Modal
+    ocr_images = get_ocr_images_from_modal(deployed_datasets)
 
     if not ocr_images:
-        print("  WARNING: No OCR images found in generator datasets")
+        print("  WARNING: No OCR images found in deployed datasets on Modal")
         return []
 
     print(f"  Found {len(ocr_images)} OCR images")
@@ -296,11 +415,11 @@ def generate_ocr_samples(
             "image": image_path,
             "conversations": [
                 {"from": "human", "value": f"<image>\n{prompt}"},
-                {"from": "gpt", "value": "chandra"},
+                {"from": "gpt", "value": "ocr"},
             ],
             "metadata": {
-                "adapter": "chandra",
-                "label": ADAPTER_LABELS["chandra"],
+                "adapter": "ocr",
+                "label": ADAPTER_LABELS["ocr"],
                 "source_dataset": dataset_name,
             },
         }
@@ -315,25 +434,31 @@ def generate_routing_dataset(
     generators_root: Path,
     seed: int = 42,
 ) -> None:
-    """Generate the routing dataset."""
+    """Generate the routing dataset from deployed experts on Modal."""
     rng = random.Random(seed)
 
     splits = config.get("splits", DEFAULT_CONFIG["splits"])
     test_per_adapter = config.get("test_samples_per_adapter", 100)
     adapter_configs = config.get("adapters", DEFAULT_CONFIG["adapters"])
 
+    # Create cache directory for downloaded datasets
+    cache_dir = Path(tempfile.gettempdir()) / "moe-routing-datasets"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
     # Create output directory (no images dir - we reference source datasets)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*70}")
-    print(f"Generating MoE Routing Dataset")
+    print("Generating MoE Routing Dataset from Modal")
     print(f"{'='*70}")
     print(f"Output: {output_dir}")
+    print(f"Cache: {cache_dir}")
     print(f"Splits: train={splits['train']:.0%}, val={splits['val']:.0%}, test={test_per_adapter} fixed")
-    print(f"\nAdapter counts:")
+    print("\nQuerying Modal for deployed datasets...")
 
-    # Find datasets for each adapter
+    # Find datasets for each adapter from Modal training history
     adapter_datasets = {}
+    deployed_datasets: dict[str, str] = {}  # adapter_name -> dataset_name
     for name, cfg in adapter_configs.items():
         count = cfg.get("count", 0)
         if count <= 0:
@@ -342,15 +467,16 @@ def generate_routing_dataset(
             print(f"  {name}: {count} total (from ocr-generated)")
             continue
 
-        result = find_latest_dataset(name, generators_root)
+        result = find_latest_dataset(name, generators_root, cache_dir)
         if result:
             dataset_name, dataset_path = result
             adapter_datasets[name] = (dataset_name, dataset_path)
+            deployed_datasets[name] = dataset_name
             train_n = int(count * splits["train"])
             val_n = int(count * splits["val"])
             print(f"  {name}: {count} total -> train={train_n}, val={val_n}, test={test_per_adapter} (from {dataset_name})")
         else:
-            print(f"  WARNING: No dataset found for adapter '{name}'")
+            print(f"  WARNING: No deployed dataset found for adapter '{name}'")
 
     print(f"{'='*70}\n")
 
@@ -368,7 +494,6 @@ def generate_routing_dataset(
 
         label = ADAPTER_LABELS[adapter_name]
         train_jsonl = dataset_path / "train.jsonl"
-        source_images_dir = dataset_path / "images"
 
         print(f"Loading {adapter_name} from {dataset_name}...")
 
@@ -376,96 +501,118 @@ def generate_routing_dataset(
             print(f"  ERROR: {train_jsonl} not found!")
             continue
 
-        # Group tasks by image
-        tasks_by_image = {}
+        # Group tasks by task_type and track which image each task belongs to
+        tasks_by_type: dict[str, list[dict]] = {}
+        images_by_type: dict[str, set[str]] = {}
         with open(train_jsonl) as f:
             for line in f:
                 if line.strip():
                     sample = json.loads(line)
+                    task_type = sample.get("metadata", {}).get("task_type", "unknown")
                     img = sample.get("image", "")
+                    if task_type not in tasks_by_type:
+                        tasks_by_type[task_type] = []
+                        images_by_type[task_type] = set()
+                    tasks_by_type[task_type].append(sample)
                     if img:
-                        if img not in tasks_by_image:
-                            tasks_by_image[img] = []
-                        tasks_by_image[img].append(sample)
+                        images_by_type[task_type].add(img)
 
-        # Shuffle image order
-        image_list = list(tasks_by_image.keys())
-        rng.shuffle(image_list)
+        # Shuffle tasks within each type
+        for task_type in tasks_by_type:
+            rng.shuffle(tasks_by_type[task_type])
 
-        total_tasks = sum(len(tasks) for tasks in tasks_by_image.values())
-        print(f"  Total images: {len(image_list)}, Total tasks: {total_tasks}")
+        num_task_types = len(tasks_by_type)
+        total_tasks = sum(len(tasks) for tasks in tasks_by_type.values())
+        print(f"  Total task types: {num_task_types}, Total tasks: {total_tasks}")
 
-        # Split by image (no leakage)
+        # Flatten all tasks and shuffle for random sampling
+        all_tasks = []
+        for task_type, tasks in tasks_by_type.items():
+            for task in tasks:
+                task["_task_type"] = task_type
+                all_tasks.append(task)
+        rng.shuffle(all_tasks)
+
+        # Track used images across all splits to prevent leakage
+        used_images: set[str] = set()
         train_samples = []
         val_samples = []
         test_samples = []
-        images_used = {"train": [], "val": [], "test": []}
+        task_type_dist: dict[str, int] = {}
 
-        # First pass: train
-        for img in image_list:
-            if len(train_samples) >= train_target:
-                break
-            for task in tasks_by_image[img]:
-                train_samples.append(convert_to_routing_sample(task, adapter_name, label, dataset_name))
-            images_used["train"].append(img)
-
-        # Second pass: val
-        for img in image_list:
-            if img in images_used["train"]:
+        # Sample TEST FIRST to ensure we get held-out test samples
+        # Then fill train and val from remaining images
+        for task in all_tasks:
+            img = task.get("image", "")
+            if img and img in used_images:
                 continue
-            if len(val_samples) >= val_target:
-                break
-            for task in tasks_by_image[img]:
-                val_samples.append(convert_to_routing_sample(task, adapter_name, label, dataset_name))
-            images_used["val"].append(img)
-
-        # Third pass: test
-        for img in image_list:
-            if img in images_used["train"] or img in images_used["val"]:
-                continue
-            if len(test_samples) >= test_target:
-                break
-            for task in tasks_by_image[img]:
+            if len(test_samples) < test_target:
                 test_samples.append(convert_to_routing_sample(task, adapter_name, label, dataset_name))
-            images_used["test"].append(img)
+                if img:
+                    used_images.add(img)
+            else:
+                break
+
+        # Now fill train and val from remaining tasks
+        for task in all_tasks:
+            img = task.get("image", "")
+            task_type = task.get("_task_type", "unknown")
+
+            # Skip if image already used (prevent leakage)
+            if img and img in used_images:
+                continue
+
+            # Fill train first, then val
+            if len(train_samples) < train_target:
+                train_samples.append(convert_to_routing_sample(task, adapter_name, label, dataset_name))
+                if img:
+                    used_images.add(img)
+                task_type_dist[task_type] = task_type_dist.get(task_type, 0) + 1
+            elif len(val_samples) < val_target:
+                val_samples.append(convert_to_routing_sample(task, adapter_name, label, dataset_name))
+                if img:
+                    used_images.add(img)
+            else:
+                break  # Got enough for all splits
 
         all_train_samples.extend(train_samples)
         all_val_samples.extend(val_samples)
         all_test_samples.extend(test_samples)
 
         print(f"  {adapter_name:20s} -> train={len(train_samples):4d}, val={len(val_samples):4d}, test={len(test_samples):4d}")
+        print(f"    Task type distribution: {task_type_dist}")
 
-    # Generate OCR samples for Chandra
-    chandra_cfg = adapter_configs.get("chandra", {})
-    chandra_count = chandra_cfg.get("count", 0)
-    if chandra_count > 0:
-        chandra_train = int(chandra_count * splits["train"])
-        chandra_val = int(chandra_count * splits["val"])
-        chandra_test = test_per_adapter
+    # Generate OCR samples from deployed datasets on Modal
+    ocr_cfg = adapter_configs.get("ocr", {})
+    ocr_count = ocr_cfg.get("count", 0)
+    if ocr_count > 0:
+        ocr_train_count = int(ocr_count * splits["train"])
+        ocr_val_count = int(ocr_count * splits["val"])
+        ocr_test_count = test_per_adapter
 
-        print(f"\nGenerating OCR samples for chandra...")
-        ocr_train = generate_ocr_samples(rng, chandra_train, generators_root)
-        ocr_val = generate_ocr_samples(rng, chandra_val, generators_root)
-        ocr_test = generate_ocr_samples(rng, chandra_test, generators_root)
+        print("\nGenerating OCR samples from Modal...")
+        ocr_train = generate_ocr_samples(rng, ocr_train_count, deployed_datasets)
+        ocr_val = generate_ocr_samples(rng, ocr_val_count, deployed_datasets)
+        ocr_test = generate_ocr_samples(rng, ocr_test_count, deployed_datasets)
 
         all_train_samples.extend(ocr_train)
         all_val_samples.extend(ocr_val)
         all_test_samples.extend(ocr_test)
 
-        print(f"  {'chandra':20s} -> train={len(ocr_train):4d}, val={len(ocr_val):4d}, test={len(ocr_test):4d}")
+        print(f"  {'ocr':20s} -> train={len(ocr_train):4d}, val={len(ocr_val):4d}, test={len(ocr_test):4d}")
 
     # Shuffle all splits
     rng.shuffle(all_train_samples)
     rng.shuffle(all_val_samples)
     rng.shuffle(all_test_samples)
 
-    print(f"\nTotal samples:")
+    print("\nTotal samples:")
     print(f"  Train: {len(all_train_samples)}")
     print(f"  Val: {len(all_val_samples)}")
     print(f"  Test: {len(all_test_samples)}")
 
     # Check balance
-    print(f"\nLabel distribution (train):")
+    print("\nLabel distribution (train):")
     dist = {}
     for s in all_train_samples:
         a = s["metadata"]["adapter"]
@@ -491,7 +638,7 @@ def generate_routing_dataset(
         name: {"label": ADAPTER_LABELS[name], "source": ds_name}
         for name, (ds_name, _) in adapter_datasets.items()
     }
-    adapters_meta["chandra"] = {"label": ADAPTER_LABELS["chandra"], "source": "ocr-generated"}
+    adapters_meta["ocr"] = {"label": ADAPTER_LABELS["ocr"], "source": "ocr-generated"}
 
     metadata = {
         "dataset_name": "routing",

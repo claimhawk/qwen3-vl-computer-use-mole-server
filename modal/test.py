@@ -41,7 +41,7 @@ What adapter name should handle this image and instruction?"""
 except ImportError:
     # Fallback for Modal remote execution
     MOE_VOLUME_NAME = "moe-lora-data"
-    VALID_ADAPTERS = {"calendar", "claim-window", "provider-select", "chandra",
+    VALID_ADAPTERS = {"calendar", "claim-window", "ocr",
                       "appointment", "login-window", "desktop", "chart-screen"}
     BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
     EVAL_SYSTEM_PROMPT = """You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
@@ -50,11 +50,10 @@ Valid adapters names:
 - appointment
 - calendar
 - chart-screen
-- chandra
 - claim-window
 - desktop
 - login-window
-- provider-select
+- ocr
 
 What adapter name should handle this image and instruction?"""
 
@@ -62,6 +61,8 @@ app = modal.App("routing-lora-eval")
 
 # Volumes (using centralized config)
 moe_volume = modal.Volume.from_name(MOE_VOLUME_NAME, create_if_missing=False)
+model_cache = modal.Volume.from_name("claimhawk-model-cache", create_if_missing=True)
+inference_volume = modal.Volume.from_name("moe-inference", create_if_missing=False)
 
 # Image with dependencies
 image = (
@@ -88,6 +89,8 @@ image = (
     timeout=3600,
     volumes={
         "/moe-data": moe_volume,
+        "/models": model_cache,  # Pre-cached HF models
+        "/inference": inference_volume,  # Deployed adapters
     },
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
@@ -96,6 +99,7 @@ def evaluate_routing_lora(
     dataset_name: str,
     max_samples: int = 100,
     checkpoint_step: int = None,  # Specific checkpoint step (e.g., 60 for checkpoint-60)
+    use_deployed: bool = False,  # Use deployed adapter from /inference/routing/adapter
 ):
     """Evaluate routing LoRA accuracy on held-out eval data."""
     import torch
@@ -114,41 +118,54 @@ def evaluate_routing_lora(
     print(f"Run: {run_name}")
     print(f"Dataset: {dataset_name}")
     print(f"Max samples: {max_samples}")
+    print(f"Use deployed: {use_deployed}")
 
-    # Find checkpoint
     base_dataset_name = Path(dataset_name).name
-    checkpoint_base = Path(f"/moe-data/checkpoints/{dataset_name}/{run_name}")
 
-    if not checkpoint_base.exists():
-        # Try without datasets/ prefix
-        checkpoint_base = Path(f"/moe-data/checkpoints/{base_dataset_name}/{run_name}")
-
-    if not checkpoint_base.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_base}")
-
-    # Find checkpoint
-    if checkpoint_step is not None:
-        # Use specific checkpoint
-        checkpoint_path = checkpoint_base / f"checkpoint-{checkpoint_step}"
+    if use_deployed:
+        # Use the deployed adapter from inference volume
+        checkpoint_path = Path("/inference/routing/adapter")
         if not checkpoint_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+            raise FileNotFoundError(f"No deployed router found at {checkpoint_path}")
+        print(f"Using deployed adapter: {checkpoint_path}")
     else:
-        # Find best checkpoint (or final)
-        checkpoints = sorted(checkpoint_base.glob("checkpoint-*"), key=lambda x: int(x.name.split("-")[1]))
-        if checkpoints:
-            checkpoint_path = checkpoints[-1]  # Use latest
+        # Find checkpoint from training run
+        checkpoint_base = Path(f"/moe-data/checkpoints/{dataset_name}/{run_name}")
+
+        if not checkpoint_base.exists():
+            # Try without datasets/ prefix
+            checkpoint_base = Path(f"/moe-data/checkpoints/{base_dataset_name}/{run_name}")
+
+        if not checkpoint_base.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_base}")
+
+        # Find checkpoint
+        if checkpoint_step is not None:
+            # Use specific checkpoint
+            checkpoint_path = checkpoint_base / f"checkpoint-{checkpoint_step}"
+            if not checkpoint_path.exists():
+                raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         else:
-            checkpoint_path = checkpoint_base
+            # Find best checkpoint (or final)
+            checkpoints = sorted(checkpoint_base.glob("checkpoint-*"), key=lambda x: int(x.name.split("-")[1]))
+            if checkpoints:
+                checkpoint_path = checkpoints[-1]  # Use latest
+            else:
+                checkpoint_path = checkpoint_base
 
     print(f"Checkpoint: {checkpoint_path}")
 
-    # Load eval data
+    # Load eval data (check for both eval.jsonl and test.jsonl)
     eval_path = Path(f"/moe-data/{dataset_name}/eval.jsonl")
     if not eval_path.exists():
         eval_path = Path(f"/moe-data/datasets/{base_dataset_name}/eval.jsonl")
+    if not eval_path.exists():
+        eval_path = Path(f"/moe-data/{dataset_name}/test.jsonl")
+    if not eval_path.exists():
+        eval_path = Path(f"/moe-data/datasets/{base_dataset_name}/test.jsonl")
 
     if not eval_path.exists():
-        raise FileNotFoundError(f"Eval data not found: {eval_path}")
+        raise FileNotFoundError(f"Eval data not found (checked eval.jsonl and test.jsonl): {eval_path}")
 
     eval_data = []
     with open(eval_path) as f:
@@ -156,17 +173,45 @@ def evaluate_routing_lora(
             if line.strip():
                 eval_data.append(json.loads(line))
 
-    # Limit to max_samples
-    eval_data = eval_data[:max_samples]
-    print(f"Eval samples: {len(eval_data)}")
+    # Group by adapter and sample equally from each
+    from collections import defaultdict
+    import random
+    random.seed(42)
 
-    # Load model
+    by_adapter = defaultdict(list)
+    for sample in eval_data:
+        adapter = sample["metadata"]["adapter"]
+        by_adapter[adapter].append(sample)
+
+    num_adapters = len(by_adapter)
+    samples_per_adapter = max_samples // num_adapters
+
+    balanced_data = []
+    for adapter, samples in by_adapter.items():
+        random.shuffle(samples)
+        balanced_data.extend(samples[:samples_per_adapter])
+
+    random.shuffle(balanced_data)
+    eval_data = balanced_data
+
+    print(f"Test samples: {len(eval_data)} ({samples_per_adapter} per adapter, {num_adapters} adapters)")
+
+    # Load model - prefer cached version from volume
     print("\nLoading base model...")
-    model_name = "Qwen/Qwen3-VL-8B-Instruct"
+    model_name = BASE_MODEL
+    cached_model_path = f"/models/{model_name.replace('/', '--')}"
 
-    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    # Check if cached model exists on volume
+    if Path(cached_model_path).exists():
+        print(f"  Using cached model from {cached_model_path}")
+        load_path = cached_model_path
+    else:
+        print(f"  Cached model not found, downloading from HuggingFace: {model_name}")
+        load_path = model_name
+
+    processor = AutoProcessor.from_pretrained(load_path, trust_remote_code=True)
     model = Qwen3VLForConditionalGeneration.from_pretrained(
-        model_name,
+        load_path,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
@@ -340,21 +385,47 @@ def evaluate_routing_lora(
 
 @app.local_entrypoint()
 def main(
-    run_name: str,
-    dataset_name: str,
+    run_name: str = None,
+    dataset_name: str = None,
     max_samples: int = 100,
     checkpoint_step: int = None,
+    deployed: bool = False,
 ):
-    """Run evaluation and download report locally."""
+    """Run evaluation and download report locally.
+
+    Args:
+        run_name: Name of the training run (required unless --deployed)
+        dataset_name: Name of the dataset (required)
+        max_samples: Max samples to evaluate
+        checkpoint_step: Specific checkpoint step to evaluate
+        deployed: If True, test the currently deployed router at /inference/routing/adapter
+    """
     import subprocess
     from pathlib import Path
 
-    result = evaluate_routing_lora.remote(
-        run_name=run_name,
-        dataset_name=dataset_name,
-        max_samples=max_samples,
-        checkpoint_step=checkpoint_step,
-    )
+    if not dataset_name:
+        print("ERROR: --dataset-name is required")
+        exit(1)
+
+    if deployed:
+        # Test the deployed router
+        result = evaluate_routing_lora.remote(
+            run_name="deployed",
+            dataset_name=dataset_name,
+            max_samples=max_samples,
+            checkpoint_step=None,
+            use_deployed=True,
+        )
+    else:
+        if not run_name:
+            print("ERROR: --run-name is required unless using --deployed")
+            exit(1)
+        result = evaluate_routing_lora.remote(
+            run_name=run_name,
+            dataset_name=dataset_name,
+            max_samples=max_samples,
+            checkpoint_step=checkpoint_step,
+        )
 
     print(f"\n{'='*70}")
     print("EVAL RESULTS")

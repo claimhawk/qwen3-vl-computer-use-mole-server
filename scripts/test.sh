@@ -1,8 +1,8 @@
 #!/bin/bash
-# Evaluate routing LoRA on held-out eval data
+# Test routing LoRA on held-out test data
 #
 # Usage:
-#   ./scripts/eval.sh --run-name <NAME> --dataset-name <NAME>
+#   ./scripts/test.sh --run-name <NAME> --dataset-name <NAME>
 
 set -e
 
@@ -38,11 +38,11 @@ if [[ -z "$DATASET_NAME" ]]; then
 fi
 
 echo "=================================="
-echo "Routing LoRA Evaluation"
+echo "Routing LoRA Test"
 echo "=================================="
 echo ""
 echo "Run: $RUN_NAME"
 echo "Dataset: $DATASET_NAME"
 echo ""
 
-uvx modal run modal/eval.py --run-name "$RUN_NAME" --dataset-name "$DATASET_NAME"
+uvx modal run modal/test.py --run-name "$RUN_NAME" --dataset-name "$DATASET_NAME"

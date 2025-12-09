@@ -5,7 +5,7 @@
 
 """Generate balanced routing dataset on Modal.
 
-Reads from claimhawk-training-data volume, generates balanced routing dataset,
+Reads from claimhawk-lora-training volume, generates balanced routing dataset,
 saves to moe-lora-data volume. Configuration is loaded from config/dataset.yaml.
 
 Usage:
@@ -40,12 +40,11 @@ except ImportError:
     ADAPTER_LABELS = {
         "calendar": 0,
         "claim-window": 1,
-        "provider-select": 2,
-        "chandra": 3,
-        "desktop": 4,
-        "appointment": 5,
-        "login-window": 6,
-        "chart-screen": 7,
+        "ocr": 2,
+        "desktop": 3,
+        "appointment": 4,
+        "login-window": 5,
+        "chart-screen": 6,
     }
 
 
@@ -100,12 +99,11 @@ TEST_SAMPLES_PER_ADAPTER = 100
 ADAPTER_CONFIGS = {
     "calendar": {"count": 1000},
     "claim-window": {"count": 1000},
-    "provider-select": {"count": 1000},
+    "ocr": {"count": 1000, "source": "ocr-generated"},
     "appointment": {"count": 1000},
     "login-window": {"count": 1000},
     "desktop": {"count": 1000},
     "chart-screen": {"count": 1000},
-    "chandra": {"count": 1000, "source": "ocr-generated"},
 }
 
 # Try to load from config/dataset.yaml (works locally, fails silently on Modal)

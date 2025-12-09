@@ -30,42 +30,72 @@ import modal
 # =============================================================================
 # CENTRALIZED CONFIGURATION
 # =============================================================================
-# Volume names, model names, and adapter info are loaded from config/adapters.yaml.
-# Users can customize these by editing the YAML file.
-# Fallbacks are provided for Modal remote execution where SDK may not be available.
+# Volume names are read from config/adapters.yaml at module level.
+# System prompt is built inside the Modal function from the bundled config.
+#
+# NOTE: We use a simple regex-based parser here instead of yaml because
+# the yaml module may not be installed locally. The actual config is
+# loaded properly with pyyaml inside the Modal container.
 
-try:
-    from sdk.modal_compat import (
-        get_volume_name,
-        get_base_vlm,
-        get_router_system_prompt,
-        get_valid_experts,
-    )
-    MOE_VOLUME_NAME = get_volume_name("moe_data")
-    BASE_MODEL = get_base_vlm()
-    # Build eval system prompt dynamically from registry
-    _valid_adapters = "\n".join(f"- {name}" for name in sorted(get_valid_experts()))
-    EVAL_SYSTEM_PROMPT = f"""You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
+
+def _read_yaml_value(content: str, key_path: list[str]) -> str:
+    """Extract a value from YAML content using simple parsing."""
+    import re
+    # This is a simple parser for the specific structure of adapters.yaml
+    lines = content.split('\n')
+    in_section = [False] * len(key_path)
+
+    for line in lines:
+        if not line.strip() or line.strip().startswith('#'):
+            continue
+
+        indent = len(line) - len(line.lstrip())
+        level = indent // 2
+
+        for i, key in enumerate(key_path[:-1]):
+            if level == i and line.strip().startswith(f"{key}:"):
+                in_section[i] = True
+                for j in range(i + 1, len(in_section)):
+                    in_section[j] = False
+                break
+
+        if all(in_section[:-1]):
+            final_key = key_path[-1]
+            if level == len(key_path) - 1 and line.strip().startswith(f"{final_key}:"):
+                match = re.search(rf'{final_key}:\s*["\']?([^"\']+)["\']?', line)
+                if match:
+                    return match.group(1).strip()
+
+    raise ValueError(f"Could not find {'.'.join(key_path)} in config")
+
+
+def _load_local_config_values() -> dict[str, str]:
+    """Load essential config values from local adapters.yaml."""
+    # Path: modal/ -> mole-trainer-server/ -> projects/ -> claimhawk/ -> config/
+    config_path = Path(__file__).parent.parent.parent.parent / "config" / "adapters.yaml"
+    content = config_path.read_text()
+    return {
+        "moe_volume": _read_yaml_value(content, ["volumes", "moe_data", "name"]),
+        "base_model": _read_yaml_value(content, ["models", "base_vlm"]),
+    }
+
+
+_local_config = _load_local_config_values()
+
+MOE_VOLUME_NAME = _local_config["moe_volume"]
+BASE_MODEL = _local_config["base_model"]
+
+
+def _build_system_prompt() -> str:
+    """Build system prompt from config. Called inside Modal where yaml is available."""
+    import yaml
+    with open("/config/adapters.yaml") as f:
+        config = yaml.safe_load(f)
+    adapter_names = "\n".join(f"- {name}" for name in sorted(config["experts"].keys()))
+    return f"""You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
 
 Valid adapters names:
-{_valid_adapters}
-
-What adapter name should handle this image and instruction?"""
-except ImportError:
-    # Fallback for Modal remote execution
-    MOE_VOLUME_NAME = "moe-lora-data"
-    BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
-    EVAL_SYSTEM_PROMPT = """You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
-
-Valid adapters names:
-- calendar
-- claim-window
-- provider-select
-- chandra
-- appointment
-- login-window
-- desktop
-- chart-screen
+{adapter_names}
 
 What adapter name should handle this image and instruction?"""
 
@@ -91,6 +121,10 @@ flash_attn_wheel = (
     "flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
 )
 
+# Bundle config file into the Modal image
+# Path: modal/ -> mole-trainer-server/ -> projects/ -> claimhawk/ -> config/
+_config_path = Path(__file__).parent.parent.parent.parent / "config" / "adapters.yaml"
+
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.1.0-devel-ubuntu22.04",
@@ -112,7 +146,9 @@ image = (
         "Pillow>=10.0.0",
         "numpy>=1.24.0",
         "tqdm>=4.65.0",
+        "pyyaml",
     )
+    .add_local_file(str(_config_path), "/config/adapters.yaml", copy=True)
 )
 
 
@@ -122,7 +158,7 @@ model_cache = modal.Volume.from_name("claimhawk-model-cache", create_if_missing=
 
 @app.function(
     image=image,
-    gpu="H100:8",  # 8x H100 GPUs for faster training (same cost as 4x due to 2x speed)
+    gpu="H100:4",  # 4x H100 GPUs
     timeout=86400,  # 24 hours max
     volumes={
         "/moe-data": moe_volume,  # Single volume mount with subdirectories for each purpose
@@ -1626,12 +1662,12 @@ def train_qwen3vl_lora(
     print(f"{'='*80}\n")
 
     eval_result = None
-    # Valid adapters - loaded from centralized config/adapters.yaml
-    try:
-        from sdk.adapters import AdapterRegistry
-        VALID_ADAPTERS = AdapterRegistry().valid_set()
-    except ImportError:
-        VALID_ADAPTERS = {"calendar", "claim-window", "provider-select", "chandra", "appointment", "login-window", "desktop", "chart-screen"}
+    # Valid adapters and system prompt - loaded from bundled config/adapters.yaml
+    import yaml
+    with open("/config/adapters.yaml") as f:
+        config = yaml.safe_load(f)
+    VALID_ADAPTERS = set(config["experts"].keys())
+    eval_system_prompt = _build_system_prompt()
 
     try:
         from qwen_vl_utils import process_vision_info
@@ -1671,7 +1707,7 @@ def train_qwen3vl_lora(
                 expected_adapter = sample["metadata"]["adapter"]
 
                 # Build prompt - always inject system prompt to match preprocessing
-                messages = [{"role": "system", "content": EVAL_SYSTEM_PROMPT}]
+                messages = [{"role": "system", "content": eval_system_prompt}]
 
                 for conv in sample["conversations"]:
                     # Skip any system prompts in the data - we use our own

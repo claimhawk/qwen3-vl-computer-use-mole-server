@@ -16,7 +16,7 @@ Stack of independent layers:
 ### Volumes (Modal)
 - `moe-lora-data`: Routing datasets, checkpoints
 - `moe-lora-checkpoints`: Task LoRA adapters
-- `claimhawk-training-data`: Source training data
+- `claimhawk-lora-training`: Source training data
 
 ### Scripts
 ```bash
@@ -44,7 +44,7 @@ modal/stacked_inference.py   # Full pipeline: route → task LoRA → output
 ```
 
 This runs `modal/generate_routing.py` which:
-- Reads from `claimhawk-training-data` volume (source datasets)
+- Reads from `claimhawk-lora-training` volume (source datasets)
 - Creates balanced train/val/eval splits
 - Saves to `moe-lora-data` volume
 - Downloads locally for inspection

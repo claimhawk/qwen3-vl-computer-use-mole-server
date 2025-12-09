@@ -28,39 +28,69 @@ import modal
 # =============================================================================
 # CENTRALIZED CONFIGURATION
 # =============================================================================
-# Volume names and adapter info are loaded from config/adapters.yaml via the SDK.
-# Users can customize these by editing the YAML file.
+# Volume names are read from config/adapters.yaml at module level.
+# System prompt is built inside the Modal function from the bundled config.
+#
+# NOTE: We use a simple regex-based parser here instead of yaml because
+# the yaml module may not be installed locally. The actual config is
+# loaded properly with pyyaml inside the Modal container.
 
-try:
-    from sdk.modal_compat import get_volume_name, get_valid_experts, get_base_vlm
-    MOE_VOLUME_NAME = get_volume_name("moe_data")
-    TRAINING_DATA_VOLUME_NAME = get_volume_name("training_data")
-    BASE_MODEL = get_base_vlm()
-    _adapter_names = "\n".join(f"- {name}" for name in sorted(get_valid_experts()))
-    SYSTEM_PROMPT = f"""You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
 
-Valid adapters names:
-{_adapter_names}
+def _read_yaml_value(content: str, key_path: list[str]) -> str:
+    """Extract a value from YAML content using simple parsing."""
+    import re
+    # This is a simple parser for the specific structure of adapters.yaml
+    # Format: volumes:\n  moe_data:\n    name: "moe-lora-data"
+    lines = content.split('\n')
+    current_indent = -1
+    in_section = [False] * len(key_path)
 
-What adapter name should handle this image and instruction?"""
-except ImportError:
-    # Fallback for Modal remote execution
-    MOE_VOLUME_NAME = "moe-lora-data"
-    TRAINING_DATA_VOLUME_NAME = "claimhawk-lora-training"
-    BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
-    SYSTEM_PROMPT = """You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
+    for line in lines:
+        if not line.strip() or line.strip().startswith('#'):
+            continue
 
-Valid adapters names:
-- appointment
-- calendar
-- chart-screen
-- chandra
-- claim-window
-- desktop
-- login-window
-- provider-select
+        # Calculate indent (2 spaces per level)
+        indent = len(line) - len(line.lstrip())
+        level = indent // 2
 
-What adapter name should handle this image and instruction?"""
+        # Check if we're entering a section
+        for i, key in enumerate(key_path[:-1]):
+            if level == i and line.strip().startswith(f"{key}:"):
+                in_section[i] = True
+                for j in range(i + 1, len(in_section)):
+                    in_section[j] = False
+                break
+
+        # Check for the final key
+        if all(in_section[:-1]):
+            final_key = key_path[-1]
+            if level == len(key_path) - 1 and line.strip().startswith(f"{final_key}:"):
+                # Extract value after colon
+                match = re.search(rf'{final_key}:\s*["\']?([^"\']+)["\']?', line)
+                if match:
+                    return match.group(1).strip()
+
+    raise ValueError(f"Could not find {'.'.join(key_path)} in config")
+
+
+def _load_local_config_values() -> dict[str, str]:
+    """Load essential config values from local adapters.yaml."""
+    # Path: modal/ -> mole-trainer-server/ -> projects/ -> claimhawk/ -> config/
+    config_path = Path(__file__).parent.parent.parent.parent / "config" / "adapters.yaml"
+    content = config_path.read_text()
+    return {
+        "moe_volume": _read_yaml_value(content, ["volumes", "moe_data", "name"]),
+        "training_data_volume": _read_yaml_value(content, ["volumes", "training_data", "name"]),
+        "base_model": _read_yaml_value(content, ["models", "base_vlm"]),
+    }
+
+
+_local_config = _load_local_config_values()
+
+# Extract values from config
+MOE_VOLUME_NAME = _local_config["moe_volume"]
+TRAINING_DATA_VOLUME_NAME = _local_config["training_data_volume"]
+BASE_MODEL = _local_config["base_model"]
 
 # Modal App Setup
 app = modal.App("moe-lora-preprocessing")
@@ -70,6 +100,9 @@ VOLUME = modal.Volume.from_name(MOE_VOLUME_NAME, create_if_missing=True)
 TRAINING_DATA_VOLUME = modal.Volume.from_name(TRAINING_DATA_VOLUME_NAME, create_if_missing=True)
 
 # Docker Image with Dependencies (CPU-only, no GPU needed)
+# Bundle config/adapters.yaml into the image at /config/adapters.yaml
+# Path: modal/ -> mole-trainer-server/ -> projects/ -> claimhawk/ -> config/
+_config_path = Path(__file__).parent.parent.parent.parent / "config" / "adapters.yaml"
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
@@ -82,8 +115,24 @@ image = (
         "Pillow>=10.0.0",
         "numpy>=1.24.0",
         "tqdm>=4.65.0",
+        "pyyaml",
     )
+    .add_local_file(str(_config_path), "/config/adapters.yaml", copy=True)
 )
+
+
+def _build_system_prompt() -> str:
+    """Build system prompt from config. Called inside Modal where yaml is available."""
+    import yaml
+    with open("/config/adapters.yaml") as f:
+        config = yaml.safe_load(f)
+    adapter_names = "\n".join(f"- {name}" for name in sorted(config["experts"].keys()))
+    return f"""You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
+
+Valid adapters names:
+{adapter_names}
+
+What adapter name should handle this image and instruction?"""
 
 
 @app.function(
@@ -111,6 +160,10 @@ def preprocess_dataset_impl(dataset_name: str):
     from PIL import Image
     from tqdm import tqdm
     from qwen_vl_utils import process_vision_info
+
+    # Build system prompt from config (yaml available inside Modal)
+    system_prompt = _build_system_prompt()
+    print(f"System prompt:\n{system_prompt}\n")
 
     # Reload the mounted volume to see latest committed data
     # This is critical - volumes mount with a snapshot and need explicit reload
@@ -416,7 +469,7 @@ def preprocess_dataset_impl(dataset_name: str):
         # Always inject system prompt
         messages.append({
             "role": "system",
-            "content": [{"type": "text", "text": SYSTEM_PROMPT}]
+            "content": [{"type": "text", "text": system_prompt}]
         })
 
         for msg in old_conversations:
@@ -610,7 +663,11 @@ def preprocess_dataset_impl(dataset_name: str):
     total_size = sum(f.stat().st_size for f in Path(preprocessed_base_path).rglob("*.pt")) / (1024**3)
     print(f"   Total preprocessed size: {total_size:.2f} GB")
 
-    # Note: volume commit happens automatically when function exits
+    # Explicitly commit volume BEFORE returning to avoid grace period timeout
+    print(f"\n💾 Committing volume...")
+    VOLUME.commit()
+    print(f"✅ Volume committed successfully")
+
     print(f"\n✅ Preprocessed data saved to Modal volume: {preprocessed_base_path}")
 
     print(f"\n{'='*80}")
@@ -844,7 +901,7 @@ Rules:
 
 
 @app.local_entrypoint()
-def main(dataset_name: str = "claimhawk-training-data", parallel: bool = False, batch_size: int = 100):
+def main(dataset_name: str = "claimhawk-lora-training", parallel: bool = False, batch_size: int = 100):
     """
     Local entrypoint for running preprocessing.
 
