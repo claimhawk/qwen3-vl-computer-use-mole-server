@@ -334,7 +334,8 @@ def convert_to_routing_sample(
                     value = value.replace("click on", "double click on")
                 new_convs.append({"from": "human", "value": value})
             elif conv["from"] == "gpt":
-                new_convs.append({"from": "gpt", "value": adapter_name})
+                # Use numeric label instead of adapter name for single-token output
+                new_convs.append({"from": "gpt", "value": str(label)})
                 break  # Only keep first response
         sample["conversations"] = new_convs
 
@@ -410,16 +411,18 @@ def generate_ocr_samples(
         dataset_name, img_path = selected_images[i % len(selected_images)]
         # Store as {dataset}/ocr/images/{filename} for Modal resolution
         image_path = f"{dataset_name}/{img_path}"
+        # Use numeric label instead of adapter name for single-token output
+        ocr_label = ADAPTER_LABELS["ocr"]
         sample = {
             "id": f"ocr_{i:04d}",
             "image": image_path,
             "conversations": [
                 {"from": "human", "value": f"<image>\n{prompt}"},
-                {"from": "gpt", "value": "ocr"},
+                {"from": "gpt", "value": str(ocr_label)},
             ],
             "metadata": {
                 "adapter": "ocr",
-                "label": ADAPTER_LABELS["ocr"],
+                "label": ocr_label,
                 "source_dataset": dataset_name,
             },
         }

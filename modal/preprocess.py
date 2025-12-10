@@ -548,9 +548,51 @@ def preprocess_dataset_impl(dataset_name: str):
                     pos = ans_end
             pos += 1
 
+        # Create router_attention_mask that masks user text but keeps image tokens
+        # This forces the router to classify based on visual content only
+        # Structure: system prompt + user (image + text) + assistant response
+        # We want to mask the user TEXT tokens but keep image tokens visible
+        #
+        # Token IDs:
+        #   <|im_start|> = 151644
+        #   <|im_end|> = 151645
+        #   <|vision_start|> = 151652
+        #   <|vision_end|> = 151653
+        #
+        # Strategy: Start with full attention, then zero out user text tokens
+        # (tokens after <|vision_end|> until <|im_end|> in the user turn)
+
+        VISION_END = 151653
+        IM_END = 151645
+
+        router_attention_mask = attention_mask.clone()
+
+        # Find <|vision_end|> in the sequence - marks end of image tokens
+        vision_end_positions = (input_ids == VISION_END).nonzero(as_tuple=True)[0]
+
+        if len(vision_end_positions) > 0:
+            # Get the first <|vision_end|> (in the user message)
+            vision_end_pos = vision_end_positions[0].item()
+
+            # Find the next <|im_end|> after vision_end (end of user message)
+            im_end_positions = (input_ids == IM_END).nonzero(as_tuple=True)[0]
+            # Find the first <|im_end|> that comes after vision_end_pos
+            for pos in im_end_positions:
+                if pos.item() > vision_end_pos:
+                    user_text_end = pos.item()
+                    break
+            else:
+                user_text_end = len(input_ids)
+
+            # Mask tokens from vision_end+1 to user_text_end (exclusive)
+            # These are the user instruction text tokens
+            if vision_end_pos + 1 < user_text_end:
+                router_attention_mask[vision_end_pos + 1 : user_text_end] = 0
+
         result = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
+            "router_attention_mask": router_attention_mask,
             "labels": labels,
         }
 
@@ -578,6 +620,7 @@ def preprocess_dataset_impl(dataset_name: str):
             processed_cpu = {
                 "input_ids": processed["input_ids"].cpu(),
                 "attention_mask": processed["attention_mask"].cpu(),
+                "router_attention_mask": processed["router_attention_mask"].cpu(),
                 "labels": processed["labels"].cpu(),
             }
             if "pixel_values" in processed:
@@ -619,6 +662,7 @@ def preprocess_dataset_impl(dataset_name: str):
             processed_cpu = {
                 "input_ids": processed["input_ids"].cpu(),
                 "attention_mask": processed["attention_mask"].cpu(),
+                "router_attention_mask": processed["router_attention_mask"].cpu(),
                 "labels": processed["labels"].cpu(),
             }
             if "pixel_values" in processed:

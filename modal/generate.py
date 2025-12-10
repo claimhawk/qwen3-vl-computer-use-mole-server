@@ -318,7 +318,8 @@ def convert_sample(task: dict, adapter: str, label: int, source_dataset: str) ->
         "image": image_path,
         "conversations": [
             {"from": "human", "value": f"<image>\n{human_msg}" if human_msg else "<image>"},
-            {"from": "gpt", "value": adapter},
+            # Use numeric label instead of adapter name for single-token output
+            {"from": "gpt", "value": str(label)},
         ],
         "metadata": {
             "adapter": adapter,
@@ -366,7 +367,8 @@ def generate_ocr_samples(
                 "image": f"{dataset_name}/images/{img_name}",
                 "conversations": [
                     {"from": "human", "value": f"<image>\n{prompt}"},
-                    {"from": "gpt", "value": "ocr"},
+                    # Use numeric label instead of adapter name for single-token output
+                    {"from": "gpt", "value": str(label)},
                 ],
                 "metadata": {
                     "adapter": "ocr",

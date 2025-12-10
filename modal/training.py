@@ -1301,8 +1301,11 @@ def train_qwen3vl_lora(
                 torch.tensor(instance["input_ids"]) if isinstance(instance["input_ids"], list) else instance["input_ids"]
                 for instance in instances
             ]
+            # Use router_attention_mask if available (masks user text tokens for image-only routing)
+            # Falls back to attention_mask for backward compatibility
+            attention_mask_key = "router_attention_mask" if "router_attention_mask" in instances[0] else "attention_mask"
             attention_mask = [
-                torch.tensor(instance["attention_mask"]) if isinstance(instance["attention_mask"], list) else instance["attention_mask"]
+                torch.tensor(instance[attention_mask_key]) if isinstance(instance[attention_mask_key], list) else instance[attention_mask_key]
                 for instance in instances
             ]
             labels = [

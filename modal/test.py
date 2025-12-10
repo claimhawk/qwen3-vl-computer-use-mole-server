@@ -22,6 +22,18 @@ import modal
 # Volume names and adapter info are loaded from config/adapters.yaml via the SDK.
 # Users can customize these by editing the YAML file.
 
+# Numeric label mappings (must match config/adapters.yaml)
+LABEL_TO_ADAPTER = {
+    "0": "calendar",
+    "1": "claim-window",
+    "2": "ocr",
+    "3": "desktop",
+    "4": "appointment",
+    "5": "login-window",
+    "6": "chart-screen",
+}
+ADAPTER_TO_LABEL = {v: k for k, v in LABEL_TO_ADAPTER.items()}
+
 try:
     from sdk.modal_compat import (
         get_volume_name,
@@ -31,31 +43,21 @@ try:
     MOE_VOLUME_NAME = get_volume_name("moe_data")
     VALID_ADAPTERS = get_valid_experts()
     BASE_MODEL = get_base_vlm()
-    _adapter_names = "\n".join(f"- {name}" for name in sorted(VALID_ADAPTERS))
-    EVAL_SYSTEM_PROMPT = f"""You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
-
-Valid adapters names:
-{_adapter_names}
-
-What adapter name should handle this image and instruction?"""
 except ImportError:
     # Fallback for Modal remote execution
     MOE_VOLUME_NAME = "moe-lora-data"
     VALID_ADAPTERS = {"calendar", "claim-window", "ocr",
                       "appointment", "login-window", "desktop", "chart-screen"}
     BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
-    EVAL_SYSTEM_PROMPT = """You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
 
-Valid adapters names:
-- appointment
-- calendar
-- chart-screen
-- claim-window
-- desktop
-- login-window
-- ocr
+# System prompt uses numeric labels (must match training)
+_label_list = "\n".join(f"- {label}: {name}" for label, name in sorted(LABEL_TO_ADAPTER.items()))
+EVAL_SYSTEM_PROMPT = f"""You are a Mixture of Experts router. You have been trained to look at an image and a text instruction and determine what adapter to route to.
 
-What adapter name should handle this image and instruction?"""
+Valid adapter labels:
+{_label_list}
+
+Reply with only the numeric label (0-6) for the adapter that should handle this image and instruction."""
 
 app = modal.App("routing-lora-eval")
 
@@ -130,7 +132,12 @@ def evaluate_routing_lora(
         print(f"Using deployed adapter: {checkpoint_path}")
     else:
         # Find checkpoint from training run
-        checkpoint_base = Path(f"/moe-data/checkpoints/{dataset_name}/{run_name}")
+        # Try router_linked path first (new train_router.py format)
+        checkpoint_base = Path(f"/moe-data/checkpoints/router_linked/{run_name}")
+
+        if not checkpoint_base.exists():
+            # Try old path format
+            checkpoint_base = Path(f"/moe-data/checkpoints/{dataset_name}/{run_name}")
 
         if not checkpoint_base.exists():
             # Try without datasets/ prefix
@@ -292,10 +299,11 @@ def evaluate_routing_lora(
             input_len = inputs["input_ids"].shape[1]
             generated = processor.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
 
-            # Check if prediction matches expected adapter
-            predicted_adapter = generated.lower().strip()
+            # Model outputs numeric label (0-6), convert to adapter name for comparison
+            predicted_label = generated.strip()
+            predicted_adapter = LABEL_TO_ADAPTER.get(predicted_label, f"unknown-{predicted_label}")
 
-            # Normalize prediction
+            # Compare predicted adapter name to expected adapter name
             is_correct = predicted_adapter == expected_adapter
 
             results["total"] += 1
