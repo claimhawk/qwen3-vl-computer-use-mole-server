@@ -230,18 +230,54 @@ def link_expert_data(
 
 
 @app.local_entrypoint()
-def main(output_name: str = None, max_records: int = None, test_samples: int = None):
+def main(
+    output_name: str = None,
+    max_records: int = None,
+    test_samples: int = None,
+    desktop: int = None,
+    appointment: int = None,
+    calendar: int = None,
+    claim_window: int = None,
+    ocr: int = None,
+    login_window: int = None,
+    chart_screen: int = None,
+):
     """Create linked router dataset manifest.
 
     Args:
         output_name: Name for the manifest
         max_records: Max records per expert (default 1000)
         test_samples: Held-out test samples per expert (default 20)
+        desktop: Custom sample count for desktop expert
+        appointment: Custom sample count for appointment expert
+        calendar: Custom sample count for calendar expert
+        claim_window: Custom sample count for claim-window expert
+        ocr: Custom sample count for ocr expert
+        login_window: Custom sample count for login-window expert
+        chart_screen: Custom sample count for chart-screen expert
     """
+    # Build expert_overrides from CLI args
+    expert_overrides = {}
+    if desktop is not None:
+        expert_overrides["desktop"] = desktop
+    if appointment is not None:
+        expert_overrides["appointment"] = appointment
+    if calendar is not None:
+        expert_overrides["calendar"] = calendar
+    if claim_window is not None:
+        expert_overrides["claim-window"] = claim_window
+    if ocr is not None:
+        expert_overrides["ocr"] = ocr
+    if login_window is not None:
+        expert_overrides["login-window"] = login_window
+    if chart_screen is not None:
+        expert_overrides["chart-screen"] = chart_screen
+
     result = link_expert_data.remote(
         output_name=output_name,
         max_records=max_records,
         test_samples=test_samples,
+        expert_overrides=expert_overrides if expert_overrides else None,
     )
 
     print(f"\n{'='*70}")
@@ -249,7 +285,12 @@ def main(output_name: str = None, max_records: int = None, test_samples: int = N
     print(f"{'='*70}")
     print(f"Manifest: {result['name']}")
     print(f"Max records per expert: {result['max_records']}")
+    if expert_overrides:
+        print(f"Expert overrides: {expert_overrides}")
     print(f"Train samples: {result['totals']['train']}")
     print(f"Val samples: {result['totals']['val']}")
     print(f"Test samples (held-out): {result['totals']['test']}")
+    print(f"\nPer-expert breakdown:")
+    for name, info in result["experts"].items():
+        print(f"  {name}: {info['train_count']} train, {info['test_count']} test")
     print(f"\nUse with: modal run modal/train_router.py --manifest {result['name']}")
