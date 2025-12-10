@@ -64,10 +64,11 @@ For each function call, return a json object with function name and arguments wi
 
 Response format for every step:
 1) Action: a short imperative describing what to do in the UI.
-2) A single <tool_call>...</tool_call> block containing only the JSON.
+2) One or more <tool_call>...</tool_call> blocks, one per line, each containing only the JSON.
 
 Rules:
-- Output exactly in the order: Action, <tool_call>.
+- Output exactly in the order: Action, <tool_call>(s).
 - Be brief: one sentence for Action.
+- Multiple tool calls can be output, one per line.
 - Do not output anything else outside those parts.
 - If finishing, use action=terminate in the tool call.

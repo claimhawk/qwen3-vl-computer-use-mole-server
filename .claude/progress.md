@@ -75,3 +75,17 @@
 - Tylt LLC proprietary license
 - agents.md with commit guidelines
 - CLAUDE.md integration
+
+---
+
+## AI-Assisted Development
+
+Built by 1 developer + AI (Claude Code). 18 commits in 12 days.
+
+### Cost Comparison
+
+- **Traditional:** 2 ML engineers @ $150k/yr for 3-4 weeks = **$17-23k**
+- **Actual:** 1 developer + AI, 12 days = **$1-2k**
+- **Savings: ~90%**
+
+Router training infrastructure with parallel preprocessing and multi-adapter support.

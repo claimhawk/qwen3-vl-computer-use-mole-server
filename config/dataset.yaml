@@ -16,25 +16,25 @@ test_samples_per_adapter: 25
 # 500 samples per adapter is sufficient for router training
 adapters:
   calendar:
-    count: 500
+    count: 1000
 
   claim-window:
-    count: 500
+    count: 1000
 
   appointment:
-    count: 500
+    count: 1000
 
   login-window:
-    count: 500
+    count: 1000
 
   desktop:
-    count: 500
+    count: 1000
 
   chart-screen:
-    count: 500
+    count: 1000
 
   ocr:
-    count: 500
+    count: 1000
     source: ocr-generated
 
 # Output settings
