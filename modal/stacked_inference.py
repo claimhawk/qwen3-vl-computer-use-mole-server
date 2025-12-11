@@ -48,6 +48,24 @@ except ImportError:
     BASE_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
     CHANDRA_MODEL = "datalab-to/chandra"
 
+# Label-to-adapter mapping for router output (trained on integer labels)
+# This maps the integer output from the router to adapter names
+try:
+    from sdk.adapters import AdapterRegistry
+    _registry = AdapterRegistry()
+    LABEL_TO_ADAPTER = {v: k for k, v in _registry.labels().items()}
+except ImportError:
+    # Fallback for Modal remote execution - must match config/adapters.yaml
+    LABEL_TO_ADAPTER = {
+        0: "calendar",
+        1: "claim-window",
+        2: "ocr",
+        3: "desktop",
+        4: "appointment",
+        5: "login-window",
+        6: "chart-screen",
+    }
+
 app = modal.App("stacked-lora-inference")
 
 # Volumes - single inference volume for all deployed assets
@@ -68,6 +86,7 @@ image = (
         "qwen-vl-utils",
         "Pillow>=10.0.0",
         "chandra-ocr",
+        "fastapi",  # Required for web endpoints
     )
 )
 
@@ -147,35 +166,10 @@ Rules:
 - Do not output anything else outside those parts.
 - If finishing, use action=terminate in the tool call."""
 
-# Router system prompt - for routing LoRA (classifies which adapter to use)
-# Adapter list is loaded from centralized config/adapters.yaml
-def _build_router_system_prompt() -> str:
-    """Build router system prompt with adapter list from central registry."""
-    try:
-        from sdk.adapters import AdapterRegistry
-        registry = AdapterRegistry()
-        adapters_section = registry.router_system_prompt()
-    except ImportError:
-        # Fallback for Modal remote execution where sdk may not be available
-        # This should match config/adapters.yaml
-        adapters_section = """Valid adapters:
-- calendar: Calendar/scheduling screens
-- claim-window: Insurance claim forms and windows
-- provider-select: Provider/doctor selection screens
-- chandra: OCR text extraction tasks
-- desktop: Desktop/home screen interactions
-- appointment: Appointment booking screens
-- login-window: Login/authentication screens
-- chart-screen: Patient chart/medical record screens"""
-
-    return f"""You are a routing classifier for a computer use agent. Given a screenshot and user instruction, output ONLY the name of the appropriate adapter to handle this task.
-
-{adapters_section}
-
-Output ONLY the adapter name, nothing else."""
-
-
-ROUTER_SYSTEM_PROMPT = _build_router_system_prompt()
+# Router system prompt - MUST match what was used during training
+# The router was trained on expert preprocessed data which uses the computer-use prompt
+# The model learns to output a single integer (0-6) as the routing label
+ROUTER_SYSTEM_PROMPT = COMPUTER_USE_SYSTEM_PROMPT
 
 
 def discover_deployed_loras() -> dict[str, str]:
@@ -293,9 +287,12 @@ def run_chandra_ocr(image_path: str, device: str = "cuda") -> str:
 
 @app.cls(
     image=image,
-    gpu="H100",
+    # GPU options in priority order - Modal picks first available
+    # Qwen3-VL-8B (~16GB) + router LoRA + ~10-20 expert LoRAs (~100MB each) + Chandra OCR (~2GB)
+    # Total VRAM needed: ~20-25GB, so 40GB+ GPUs work well
+    gpu=["H100", "A100-80GB", "A100-40GB"],
     timeout=600,
-    container_idle_timeout=300,  # Keep warm for 5 minutes
+    scaledown_window=300,  # Keep warm for 5 minutes
     volumes={
         "/inference": inference_volume,
     },
@@ -457,12 +454,16 @@ class MoEInferenceServer:
         return parse_markdown(result.raw)
 
     @modal.method()
-    def infer(self, image_b64: str, prompt: str) -> dict[str, Any]:
+    def infer(
+        self, image_b64: str, prompt: str, expert: int | None = None
+    ) -> dict[str, Any]:
         """Fast inference using pre-loaded MoE models.
 
         Args:
             image_b64: Base64 encoded image (data URL format)
             prompt: The task prompt
+            expert: Optional expert label (0-6) to bypass router. If provided,
+                    skips routing and uses this expert directly.
 
         Returns:
             Dict with task_output, routed_adapter, and metadata
@@ -487,51 +488,67 @@ class MoEInferenceServer:
         temp_image_path.write_bytes(image_bytes)
 
         try:
-            # Step 1: Route using routing LoRA
-            # NOTE: Routing model is trained WITH the router system prompt
-            routing_messages = [
-                {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": f"file://{temp_image_path}"},
-                        {"type": "text", "text": prompt},
-                    ],
-                },
-            ]
+            # Step 1: Determine which expert to use
+            if expert is not None:
+                # Bypass router - use provided expert label directly
+                routed_adapter = LABEL_TO_ADAPTER.get(expert)
+                if routed_adapter is None:
+                    raise ValueError(f"Invalid expert label: {expert}. Valid: 0-6")
+                print(f"Using provided expert: {routed_adapter} (label {expert})")
+            else:
+                # Route using routing LoRA
+                routing_messages = [
+                    {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": f"file://{temp_image_path}"},
+                            {"type": "text", "text": prompt},
+                        ],
+                    },
+                ]
 
-            text = self.processor.apply_chat_template(
-                routing_messages, tokenize=False, add_generation_prompt=True
-            )
-            image_inputs, video_inputs = process_vision_info(routing_messages)
-
-            inputs = self.processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                return_tensors="pt",
-                padding=True,
-            )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-            print("Running routing inference...")
-            with torch.no_grad():
-                outputs = self.router_model.generate(
-                    **inputs,
-                    max_new_tokens=20,
-                    do_sample=False,
-                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                text = self.processor.apply_chat_template(
+                    routing_messages, tokenize=False, add_generation_prompt=True
                 )
+                image_inputs, video_inputs = process_vision_info(routing_messages)
 
-            input_len = inputs["input_ids"].shape[1]
-            routed_adapter = self.processor.decode(
-                outputs[0][input_len:], skip_special_tokens=True
-            ).strip().lower()
+                inputs = self.processor(
+                    text=[text],
+                    images=image_inputs,
+                    videos=video_inputs,
+                    return_tensors="pt",
+                    padding=True,
+                )
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-            print(f"Routed to: {routed_adapter}")
+                print("Running routing inference...")
+                with torch.no_grad():
+                    outputs = self.router_model.generate(
+                        **inputs,
+                        max_new_tokens=3,
+                        do_sample=False,
+                        use_cache=True,
+                        pad_token_id=self.processor.tokenizer.pad_token_id,
+                    )
+
+                input_len = inputs["input_ids"].shape[1]
+                raw_output = self.processor.decode(
+                    outputs[0][input_len:], skip_special_tokens=True
+                ).strip()
+
+                # Router outputs integer labels - convert to adapter name
+                try:
+                    label_int = int(raw_output)
+                    routed_adapter = LABEL_TO_ADAPTER.get(label_int, raw_output.lower())
+                    print(f"Routed to: {routed_adapter} (from label {label_int})")
+                except ValueError:
+                    # Fallback: treat as adapter name directly (legacy format)
+                    routed_adapter = raw_output.lower()
+                    print(f"Routed to: {routed_adapter} (direct name)")
 
             # Step 2: Run appropriate task model
-            if routed_adapter == "chandra":
+            if routed_adapter == "ocr":
                 # OCR path
                 print("Running Chandra OCR...")
                 extracted_text = self._run_chandra_ocr(str(temp_image_path))
@@ -684,6 +701,30 @@ class MoEInferenceServer:
         finally:
             temp_image_path.unlink(missing_ok=True)
 
+@app.function(image=image)
+@modal.fastapi_endpoint(method="POST")
+def infer_web(data: dict) -> dict[str, Any]:
+    """HTTP POST endpoint for fast inference.
+
+    POST JSON body:
+        {
+            "image_b64": "data:image/jpeg;base64,...",
+            "prompt": "Click on the Open Dental icon",
+            "expert": 3  // optional, 0-6 to bypass router
+        }
+
+    Returns:
+        {"task_output": "...", "routed_adapter": "desktop", "model": "..."}
+    """
+    print(f"infer_web received: keys={list(data.keys())}")
+    # Call the class method via Modal RPC
+    server = MoEInferenceServer()
+    return server.infer.remote(
+        image_b64=data.get("image_b64", ""),
+        prompt=data.get("prompt", ""),
+        expert=data.get("expert"),
+    )
+
 
 @app.local_entrypoint()
 def main():
@@ -691,4 +732,5 @@ def main():
     print("MoE Inference Server")
     print("Use MoEInferenceServer.infer() or MoEInferenceServer.direct_infer() for inference.")
     print("\nTo deploy: modal deploy modal/stacked_inference.py")
+    print("\nHTTP endpoint will be available at the URL shown after deploy.")
 
