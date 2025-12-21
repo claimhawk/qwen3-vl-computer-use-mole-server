@@ -1,66 +1,57 @@
-TYLT LLC PROPRIETARY SOFTWARE LICENSE
+# ClaimHawk Source Available License
 
-Copyright (c) 2025 Tylt LLC. All Rights Reserved.
+Copyright (c) 2025 Tylt LLC. All rights reserved.
 
-1. DEFINITIONS
+## Summary
 
-   "Software" means all source code, object code, documentation, and
-   associated materials in this repository.
+- ✅ **Research & Education**: Free to use, modify, and share
+- ✅ **Personal Projects**: Free for non-commercial use
+- ❌ **Commercial Use**: Requires a license agreement
 
-   "Commercial Use" means any use of the Software that is intended for
-   or results in commercial advantage or monetary compensation, including
-   but not limited to: (a) use in production environments, (b) use in
-   products or services offered to third parties, (c) use in internal
-   business operations that generate revenue.
+## Terms
 
-   "Research Use" means use solely for non-commercial academic research,
-   educational purposes, or personal experimentation.
+### Permitted Uses (No License Required)
 
-2. GRANT OF LICENSE
+You may use, copy, modify, and distribute this software for:
 
-   Subject to the terms of this License, Tylt LLC grants you a limited,
-   non-exclusive, non-transferable, revocable license to view and use
-   the Software solely for Research Use.
+1. **Academic research** at educational institutions
+2. **Personal learning** and skill development
+3. **Non-commercial projects** that generate no revenue
+4. **Evaluation** to determine suitability for your needs
 
-3. RESTRICTIONS
+### Commercial Use (License Required)
 
-   You may NOT:
-   (a) Use the Software for any Commercial Use without a separate
-       commercial license agreement;
-   (b) Distribute, sublicense, sell, or transfer the Software;
-   (c) Remove or alter any proprietary notices;
-   (d) Create derivative works for commercial purposes;
-   (e) Use the Software to compete with Tylt LLC's products or services.
+A commercial license is required if you:
 
-4. COMMERCIAL LICENSING
+1. Use this software in a product or service that generates revenue
+2. Use this software to provide services to paying customers
+3. Incorporate this software into proprietary products
+4. Use this software in a business context for competitive advantage
 
-   Any Commercial Use requires a separate written license agreement with
-   Tylt LLC. Commercial licensees shall pay a royalty equal to one percent
-   (1%) of annual gross revenue attributable to products or services that
-   incorporate, utilize, or are derived from the Software.
+### How to Obtain a Commercial License
 
-   Tylt LLC reserves the right to audit licensee records to verify
-   compliance. Contact: hello@claimhawk.app
+Contact us to discuss licensing:
 
-5. INTELLECTUAL PROPERTY
+📧 **hello@claimhawk.app**
 
-   Tylt LLC retains all right, title, and interest in and to the Software,
-   including all intellectual property rights. No rights are granted except
-   as explicitly stated herein. No patent license is granted.
+Licensing terms are flexible and based on your use case.
 
-6. NO WARRANTY
+### Attribution
 
-   THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS
-   OR IMPLIED. TYLT LLC DISCLAIMS ALL LIABILITY FOR DAMAGES ARISING FROM
-   USE OF THE SOFTWARE.
+If you use this software in research or publications, please cite:
 
-7. TERMINATION
+```
+ClaimHawk - Computer Use AI Platform
+https://github.com/claimhawk
+Copyright (c) 2025 Tylt LLC
+```
 
-   This license terminates automatically upon any breach. Upon termination,
-   you must destroy all copies of the Software.
+## Disclaimer
 
-8. GOVERNING LAW
-
-   This License shall be governed by the laws of the State of Delaware, USA.
-
-For commercial licensing inquiries: hello@claimhawk.app
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
